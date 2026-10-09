@@ -1,0 +1,15 @@
+{
+ "input": {
+  "source": {"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "start": 1.0, "end": 9.0},
+  "cache": {"get_url": "https://raw.githubusercontent.com/sermountapp/sermount-clip-worker/main/samples/sample-10s.mp4", "put_url": null, "token": null},
+  "output": {"put_url": "REPLACE_WITH_A_SIGNED_UPLOAD_URL", "token": "REPLACE_WITH_ITS_TOKEN", "container": "mp4"},
+  "aspect": "9:16", "width": 1080, "height": 1920,
+  "captions": {"cues": [
+   {"s": 0.0, "e": 2.4, "words": [{"w": "This", "s": 0.0, "e": 0.3}, {"w": "is", "s": 0.3, "e": 0.5}, {"w": "a", "s": 0.5, "e": 0.6}, {"w": "sample", "s": 0.6, "e": 1.1}, {"w": "render.", "s": 1.1, "e": 1.6}]},
+   {"s": 2.6, "e": 5.9, "words": [{"w": "John", "s": 2.6, "e": 2.9}, {"w": "3:16", "s": 2.9, "e": 3.4}, {"w": "stays", "s": 3.4, "e": 3.7}, {"w": "on", "s": 3.7, "e": 3.8}, {"w": "one", "s": 3.8, "e": 4.0}, {"w": "cue.", "s": 4.0, "e": 4.4}]}
+  ]},
+  "edits": {"removed": [[6.0, 7.0]]},
+  "normalize_audio": true,
+  "max_output_seconds": 1200
+ }
+}

@@ -1,0 +1,6 @@
+# Pinned 2026-10-09. yt-dlp matches sermount-web's pin (same proxy-free
+# range fetch rules); runpod matches the whisperx worker.
+runpod==1.12.0
+yt-dlp==2026.8.19
+requests==2.34.2
+pillow==12.2.0
