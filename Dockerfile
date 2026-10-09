@@ -13,8 +13,10 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/* \
- && ffmpeg -hide_banner -encoders | grep -q h264_nvenc \
- && ffmpeg -hide_banner -filters | grep -qw overlay
+ && ffmpeg -hide_banner -encoders 2>/dev/null | grep h264_nvenc >/dev/null \
+ && ffmpeg -hide_banner -filters 2>/dev/null | grep -w overlay >/dev/null
+# (no grep -q: it exits on the first match while ffmpeg is still writing, and
+#  under the build shell's pipefail that SIGPIPE reported the check as failed.)
 
 RUN python3.11 -m venv /opt/venv
 COPY requirements.txt /app/requirements.txt
