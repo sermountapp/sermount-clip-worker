@@ -59,7 +59,7 @@ from urllib.parse import urlparse
 
 import requests
 
-IMAGE_TAG = "v0.1.0"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.1.1"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -80,6 +80,8 @@ FONT_CANDIDATES = (
 )
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
+PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
+FETCH_RETRY_SLEEP = 2.0
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("clips")
@@ -92,6 +94,24 @@ log.propagate = False
 
 _FETCH_LOCK = threading.Lock()
 _ENCODER = None
+
+
+def proxy_from_env(value):
+    """(url or None, "on" | "off" | "invalid"). Same shape check as the app's
+    app/proxy.py: a supported scheme, a hostname and a port. The value carries
+    credentials, so it is never logged or returned in a result; only the
+    state is."""
+    if not value or not value.strip():
+        return None, "off"
+    try:
+        parsed = urlparse(value.strip())
+        ok = parsed.scheme.lower() in PROXY_SCHEMES and bool(parsed.hostname) and bool(parsed.port)
+    except ValueError:
+        ok = False
+    return (value.strip(), "on") if ok else (None, "invalid")
+
+
+PROXY_URL, PROXY_STATE = proxy_from_env(os.environ.get("PROXY_URL"))
 
 
 class ClipError(Exception):
@@ -556,7 +576,7 @@ def ytdlp_options(out_path, range_start, range_end):
     the pin the container defaults to webm, which rejects H.264 and forces a
     VP9 software transcode of every fetch (SermonVault §5)."""
     import yt_dlp
-    return {
+    opts = {
         "format": "bestvideo[height<=1080]+bestaudio/best",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(range_start, range_end)]),
         "force_keyframes_at_cuts": True,
@@ -567,17 +587,27 @@ def ytdlp_options(out_path, range_start, range_end):
         "retries": 3, "fragment_retries": 3,
         "noplaylist": True,
     }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    return opts
 
 
 def fetch_youtube_range(url, out_path, range_start, range_end):
     import yt_dlp
     opts = ytdlp_options(out_path, range_start, range_end)
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        log.info("yt-dlp failed type=%s", type(exc).__name__)
-        raise ClipError("fetch")
+    for attempt in (1, 2):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            break
+        except Exception as exc:
+            # type only: a DownloadError message can quote the proxy URL
+            log.info("yt-dlp failed type=%s attempt=%d", type(exc).__name__, attempt)
+            if attempt == 2:
+                raise ClipError("fetch")
+            if os.path.exists(out_path):
+                os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
+            time.sleep(FETCH_RETRY_SLEEP)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise ClipError("fetch")
 
@@ -704,6 +734,10 @@ def run(job_input):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def log_startup():
+    log.info("clip worker %s encoder=%s proxy=%s", IMAGE_TAG, _ENCODER, PROXY_STATE)
+
+
 def handler(job):
     return run((job or {}).get("input"))
 
@@ -712,5 +746,5 @@ if __name__ == "__main__":
     import runpod
 
     pick_encoder()  # probe before taking jobs
-    log.info("clip worker %s encoder=%s", IMAGE_TAG, _ENCODER)
+    log_startup()
     runpod.serverless.start({"handler": handler})

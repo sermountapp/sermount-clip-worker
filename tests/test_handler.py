@@ -122,6 +122,93 @@ def test_ytdlp_options_carry_both_halves_of_the_fix():
     assert handler.padded_range(4.0, 20.0) == (0, 30)
 
 
+SECRET_PROXY = "http://user-sp1:s3cr3t%2Bpw@gate.example.test:10001"
+
+
+@pytest.mark.parametrize("value,state", [
+    (SECRET_PROXY, "on"), ("socks5h://u:p@gate.example.test:7000", "on"),
+    (None, "off"), ("  ", "off"),
+    ("gate.example.test:10001", "invalid"), ("ftp://u:p@gate.example.test:21", "invalid"),
+    ("http://u:p@gate.example.test", "invalid"), ("http://u:p@gate.example.test:notaport", "invalid"),
+])
+def test_ytdlp_options_carry_the_proxy_only_when_valid(monkeypatch, value, state):
+    url, got = handler.proxy_from_env(value)
+    assert got == state
+    monkeypatch.setattr(handler, "PROXY_URL", url)
+    opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
+    if state == "on":
+        assert opts["proxy"] == value
+    else:
+        assert "proxy" not in opts
+    # the fix's two halves are untouched either way
+    assert opts["external_downloader_args"] == {"ffmpeg_o": ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]}
+    assert opts["merge_output_format"] == "mp4"
+
+
+def _fake_youtubedl(failures, calls):
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            calls.append(dict(self.opts))
+            if len(calls) <= failures:
+                import yt_dlp
+                raise yt_dlp.utils.DownloadError(f"ERROR: Sign in to confirm you're not a bot (via {self.opts.get('proxy')})")
+            shutil.copyfile(SAMPLE, self.opts["outtmpl"])
+    return FakeYDL
+
+
+def test_fetch_retries_once_then_reports_fetch(monkeypatch, tmp_path):
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
+
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(1, calls))
+    out = tmp_path / "once.mp4"
+    handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(out), 90, 118)
+    assert len(calls) == 2 and out.stat().st_size > 0
+    assert calls[1]["proxy"] == SECRET_PROXY  # same options on the retry
+
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(2, calls))
+    with pytest.raises(handler.ClipError) as err:
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "twice.mp4"), 90, 118)
+    assert err.value.reason == "fetch" and len(calls) == 2
+
+
+def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path):
+    import logging
+    import yt_dlp
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(self.format(record))
+
+    grab = Grab()
+    handler.log.addHandler(grab)
+    try:
+        monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+        monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
+        monkeypatch.setattr(handler, "PROXY_STATE", "on")
+        monkeypatch.setattr(handler, "_ENCODER", "libx264")
+        handler.log_startup()
+        monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(2, []))
+        result = handler.run(_job())
+    finally:
+        handler.log.removeHandler(grab)
+    assert lines[0] == "clip worker v0.1.1 encoder=libx264 proxy=on"
+    assert any("yt-dlp failed type=DownloadError attempt=1" in ln for ln in lines)
+    assert any("yt-dlp failed type=DownloadError attempt=2" in ln for ln in lines)
+    assert result["ok"] is False and result["reason"] == "fetch"
+    blob = "\n".join(lines) + json.dumps(result)
+    for part in ("s3cr3t", "user-sp1", "gate.example.test", SECRET_PROXY):
+        assert part not in blob
+
+
 def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path):
     """The real FFmpegFD builds its argv from our options; only the spawn is
     faked. This is the SermonVault §5 lesson: a value reaching the process

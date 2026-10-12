@@ -94,7 +94,7 @@ Dockerfile path `Dockerfile`.
 | Execution timeout | 5400 s (fetch time is dominated by YouTube's checks, not length) |
 | FlashBoot | on |
 | Network volume | none |
-| Environment variables | none needed |
+| Environment variables | `PROXY_URL`: required for YouTube sermons (RunPod datacenter IPs get YouTube's "Sign in to confirm you're not a bot" wall without it). The same value the Render staging worker uses. Set it as an endpoint secret, never in the Dockerfile or a job input. Audio sermons do not use it. |
 
 After the endpoint exists, create an API key **scoped to this endpoint** (keys are per endpoint;
 the alignment key returns 403 here). It goes into the Render **worker** service only, as
