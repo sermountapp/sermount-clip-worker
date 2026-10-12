@@ -155,6 +155,7 @@ def _fake_youtubedl(failures, calls):
             calls.append(dict(self.opts))
             if len(calls) <= failures:
                 import yt_dlp
+                self.opts["logger"].error(f"ERROR: [youtube] x: Sign in to confirm you're not a bot (via {self.opts.get('proxy')})")
                 raise yt_dlp.utils.DownloadError(f"ERROR: Sign in to confirm you're not a bot (via {self.opts.get('proxy')})")
             shutil.copyfile(SAMPLE, self.opts["outtmpl"])
     return FakeYDL
@@ -179,7 +180,7 @@ def test_fetch_retries_once_then_reports_fetch(monkeypatch, tmp_path):
     assert err.value.reason == "fetch" and len(calls) == 2
 
 
-def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path):
+def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path, capsys):
     import logging
     import yt_dlp
     lines = []
@@ -204,9 +205,41 @@ def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path):
     assert any("yt-dlp failed type=DownloadError attempt=1" in ln for ln in lines)
     assert any("yt-dlp failed type=DownloadError attempt=2" in ln for ln in lines)
     assert result["ok"] is False and result["reason"] == "fetch"
+    assert any("yt-dlp message dropped kind=error n=1" in ln for ln in lines)
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
     blob = "\n".join(lines) + json.dumps(result)
     for part in ("s3cr3t", "user-sp1", "gate.example.test", SECRET_PROXY):
         assert part not in blob
+
+
+def test_real_youtubedl_routes_its_messages_to_our_logger(monkeypatch, capsys):
+    """The real YoutubeDL, not a fake: its error, warning and screen output
+    must go through the logger option and leave stderr and stdout empty."""
+    import logging
+    import yt_dlp
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(self.format(record))
+
+    monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
+    opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
+    assert "logger" in opts and opts["proxy"] == SECRET_PROXY
+    grab = Grab()
+    handler.log.addHandler(grab)
+    try:
+        ydl = yt_dlp.YoutubeDL(opts)
+        ydl.to_screen(f"[youtube] fetching via {SECRET_PROXY}")
+        ydl.report_warning(f"proxy {SECRET_PROXY} slow")
+        with pytest.raises(yt_dlp.utils.DownloadError):
+            ydl.report_error(f"407 Proxy Authentication Required {SECRET_PROXY}")
+    finally:
+        handler.log.removeHandler(grab)
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
+    assert lines == ["yt-dlp message dropped kind=warning n=1", "yt-dlp message dropped kind=error n=1"]
 
 
 def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path):

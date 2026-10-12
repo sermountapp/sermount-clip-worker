@@ -569,6 +569,31 @@ def padded_range(start, end, pad=PAD_SECS):
     return math.floor(max(0.0, start - pad)), math.ceil(end + pad)
 
 
+class _QuietYdlLogger:
+    """yt-dlp's own messages never reach stderr: a bot-wall ERROR line or a
+    proxy 407 can quote the proxy URL, which carries credentials. Warnings
+    and errors leave one fixed line with a running count, never the text."""
+
+    def __init__(self):
+        self.dropped = {"warning": 0, "error": 0}
+
+    def _drop(self, kind):
+        self.dropped[kind] += 1
+        log.info("yt-dlp message dropped kind=%s n=%d", kind, self.dropped[kind])
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self._drop("warning")
+
+    def error(self, msg):
+        self._drop("error")
+
+
 def ytdlp_options(out_path, range_start, range_end):
     """yt-dlp options for one range. The encoder arguments go in
     external_downloader_args (FFmpegFD reads those; postprocessor_args is
@@ -586,6 +611,7 @@ def ytdlp_options(out_path, range_start, range_end):
         "quiet": True, "no_warnings": True, "noprogress": True,
         "retries": 3, "fragment_retries": 3,
         "noplaylist": True,
+        "logger": _QuietYdlLogger(),
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
