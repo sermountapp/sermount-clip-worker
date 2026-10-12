@@ -96,6 +96,8 @@ Dockerfile path `Dockerfile`.
 | Network volume | none |
 | Environment variables | `PROXY_URL`: required for YouTube sermons (RunPod datacenter IPs get YouTube's "Sign in to confirm you're not a bot" wall without it). The same value the Render staging worker uses. Set it as an endpoint secret, never in the Dockerfile or a job input. Audio sermons do not use it. |
 
+The worker also hands `PROXY_URL` to ffmpeg (`-http_proxy`) for the range fetch, so the proxy port must map to one fixed IP for the duration of a fetch: the media URL is bound to the IP that resolved it.
+
 After the endpoint exists, create an API key **scoped to this endpoint** (keys are per endpoint;
 the alignment key returns 403 here). It goes into the Render **worker** service only, as
 `RUNPOD_CLIP_API_KEY` with `RUNPOD_CLIP_ENDPOINT_ID` (`sync: false`). Never into the web service,

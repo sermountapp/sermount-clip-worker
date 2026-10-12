@@ -138,11 +138,44 @@ def test_ytdlp_options_carry_the_proxy_only_when_valid(monkeypatch, value, state
     opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
     if state == "on":
         assert opts["proxy"] == value
+        assert opts["external_downloader_args"]["ffmpeg_i"] == ["-http_proxy", value]
     else:
         assert "proxy" not in opts
+        assert "ffmpeg_i" not in opts["external_downloader_args"]
     # the fix's two halves are untouched either way
-    assert opts["external_downloader_args"] == {"ffmpeg_o": ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]}
+    assert opts["external_downloader_args"]["ffmpeg_o"] == ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]
     assert opts["merge_output_format"] == "mp4"
+
+
+def test_ytdlp_messages_are_logged_redacted_and_capped(monkeypatch, capsys):
+    import logging
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(self.format(record))
+
+    monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
+    logger = handler.ytdlp_options("/tmp/x.mp4", 90, 118)["logger"]
+    grab = Grab()
+    handler.log.addHandler(grab)
+    try:
+        logger.warning(f"WARNING: url={SECRET_PROXY}\n pw=s3cr3t%2Bpw decoded=s3cr3t+pw user=user-sp1 host=gate.example.test")
+        logger.error("ERROR: " + "x" * 2048)
+        logger.info(f"[download] via {SECRET_PROXY}")
+        logger.debug(f"[debug] via {SECRET_PROXY}")
+    finally:
+        handler.log.removeHandler(grab)
+    assert lines[0] == ("yt-dlp warning: WARNING: url=[proxy] pw=[proxy] decoded=[proxy] "
+                        "user=[proxy] host=[proxy]")
+    assert lines[1] == "yt-dlp error: " + ("ERROR: " + "x" * 2048)[:300]
+    assert len(lines) == 2
+    for part in ("s3cr3t", "user-sp1", "gate.example.test"):
+        assert part not in "\n".join(lines)
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
+    # no proxy: nothing to redact, the cap still applies
+    assert handler.redact("a\n  b " + "y" * 500, handler.proxy_secrets(None)) == ("a b " + "y" * 500)[:300]
 
 
 def _fake_youtubedl(failures, calls):
@@ -201,11 +234,11 @@ def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path, capsys):
         result = handler.run(_job())
     finally:
         handler.log.removeHandler(grab)
-    assert lines[0] == "clip worker v0.1.1 encoder=libx264 proxy=on"
+    assert lines[0] == f"clip worker {handler.IMAGE_TAG} encoder=libx264 proxy=on"
     assert any("yt-dlp failed type=DownloadError attempt=1" in ln for ln in lines)
     assert any("yt-dlp failed type=DownloadError attempt=2" in ln for ln in lines)
     assert result["ok"] is False and result["reason"] == "fetch"
-    assert any("yt-dlp message dropped kind=error n=1" in ln for ln in lines)
+    assert any("yt-dlp error: ERROR: [youtube] x: Sign in to confirm you're not a bot (via [proxy])" in ln for ln in lines)
     out = capsys.readouterr()
     assert out.out == "" and out.err == ""
     blob = "\n".join(lines) + json.dumps(result)
@@ -239,10 +272,12 @@ def test_real_youtubedl_routes_its_messages_to_our_logger(monkeypatch, capsys):
         handler.log.removeHandler(grab)
     out = capsys.readouterr()
     assert out.out == "" and out.err == ""
-    assert lines == ["yt-dlp message dropped kind=warning n=1", "yt-dlp message dropped kind=error n=1"]
+    assert lines == ["yt-dlp warning: proxy [proxy] slow",
+                     "yt-dlp error: ERROR: 407 Proxy Authentication Required [proxy]"]
 
 
-def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path):
+@pytest.mark.parametrize("proxy", [None, SECRET_PROXY])
+def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path, monkeypatch, proxy):
     """The real FFmpegFD builds its argv from our options; only the spawn is
     faked. This is the SermonVault §5 lesson: a value reaching the process
     is not a value taking effect, so read the args back out of the argv."""
@@ -259,6 +294,7 @@ def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path):
         def __exit__(self, *a): return False
         def wait(self): return 0
 
+    monkeypatch.setattr(handler, "PROXY_URL", proxy)
     opts = handler.ytdlp_options(str(tmp_path / "source.%(ext)s"), 90, 119)
     ydl = yt_dlp.YoutubeDL(opts)
     fd = FFmpegFD(ydl, ydl.params)
@@ -274,6 +310,14 @@ def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path):
     assert "-f mp4" in joined, joined
     assert args[-1].endswith("source.mp4")
     assert "-c copy" not in joined  # force_keyframes_at_cuts re-encodes at the cut
+    if proxy:
+        # before every input: the video and the audio URL are both IP-bound
+        inputs = [i for i, a in enumerate(args) if a == "-i"]
+        assert len(inputs) == 2
+        for i in inputs:
+            assert args[i - 2:i] == ["-http_proxy", proxy], args
+    else:
+        assert "-http_proxy" not in args
 
 
 # ── ffmpeg command ────────────────────────────────────────────────────────────

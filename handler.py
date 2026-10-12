@@ -55,11 +55,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.1.1"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.1.2"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -82,6 +82,7 @@ FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
 FETCH_RETRY_SLEEP = 2.0
+YTDLP_MESSAGE_CAP = 300
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("clips")
@@ -569,17 +570,36 @@ def padded_range(start, end, pad=PAD_SECS):
     return math.floor(max(0.0, start - pad)), math.ceil(end + pad)
 
 
-class _QuietYdlLogger:
-    """yt-dlp's own messages never reach stderr: a bot-wall ERROR line or a
-    proxy 407 can quote the proxy URL, which carries credentials. Warnings
-    and errors leave one fixed line with a running count, never the text."""
+def proxy_secrets(proxy_url):
+    """Every fragment of the proxy URL a message could quote: the URL, its
+    username, its password (as written and percent-decoded) and its host.
+    Longest first, so the full URL is replaced before its parts."""
+    if not proxy_url:
+        return ()
+    parsed = urlparse(proxy_url)
+    parts = {proxy_url, parsed.hostname or ""}
+    for part in (parsed.username, parsed.password):
+        if part:
+            parts.update({part, unquote(part)})
+    return tuple(sorted((p for p in parts if p), key=len, reverse=True))
 
-    def __init__(self):
-        self.dropped = {"warning": 0, "error": 0}
 
-    def _drop(self, kind):
-        self.dropped[kind] += 1
-        log.info("yt-dlp message dropped kind=%s n=%d", kind, self.dropped[kind])
+def redact(msg, secrets):
+    """One line, no proxy fragment, at most YTDLP_MESSAGE_CAP characters."""
+    text = " ".join(str(msg).split())
+    for secret in secrets:
+        text = text.replace(secret, "[proxy]")
+    return text[:YTDLP_MESSAGE_CAP]
+
+
+class _RedactingYdlLogger:
+    """yt-dlp's own messages never reach stderr unredacted: a bot-wall line or
+    a proxy 407 can quote the proxy URL, which carries credentials. Warnings
+    and errors are logged with every proxy fragment replaced by [proxy];
+    debug and info are dropped."""
+
+    def __init__(self, secrets):
+        self.secrets = secrets
 
     def debug(self, msg):
         pass
@@ -588,10 +608,10 @@ class _QuietYdlLogger:
         pass
 
     def warning(self, msg):
-        self._drop("warning")
+        log.info("yt-dlp warning: %s", redact(msg, self.secrets))
 
     def error(self, msg):
-        self._drop("error")
+        log.info("yt-dlp error: %s", redact(msg, self.secrets))
 
 
 def ytdlp_options(out_path, range_start, range_end):
@@ -611,10 +631,15 @@ def ytdlp_options(out_path, range_start, range_end):
         "quiet": True, "no_warnings": True, "noprogress": True,
         "retries": 3, "fragment_retries": 3,
         "noplaylist": True,
-        "logger": _QuietYdlLogger(),
+        "logger": _RedactingYdlLogger(proxy_secrets(PROXY_URL)),
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
+        # With download_ranges FFmpegFD fetches the media; yt-dlp hands it
+        # the proxy only as env vars, so pass it as ffmpeg's own input option
+        # too (placed before every -i). The media URL is bound to the IP that
+        # resolved it, so ffmpeg must leave through the same proxy.
+        opts["external_downloader_args"]["ffmpeg_i"] = ["-http_proxy", PROXY_URL]
     return opts
 
 
