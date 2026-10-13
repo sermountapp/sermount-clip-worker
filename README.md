@@ -16,7 +16,7 @@ Input (`POST /v2/{endpoint_id}/run`, body `{"input": ...}`):
  "cache": {"get_url": "<signed GET or null>", "put_url": "<signed PUT or null>", "token": "..."},
  "output": {"put_url": "<signed PUT>", "token": "...", "container": "mp4"},
  "aspect": "9:16", "width": 1080, "height": 1920,
- "captions": {"cues": [{"s": 0.0, "e": 2.1, "words": [{"w": "I", "s": 0.0, "e": 0.2}]}]},
+ "captions": {"cues": [{"s": 0.0, "e": 2.1, "words": [{"w": "I", "s": 0.0, "e": 0.2}]}], "position": "bottom"},
  "edits": {"removed": [[12.4, 13.1]]},
  "normalize_audio": true,
  "max_output_seconds": 1200,
@@ -34,7 +34,10 @@ Input (`POST /v2/{endpoint_id}/run`, body `{"input": ...}`):
   (1920×1080, 1080×1080, 1080×1920) and `container: mp4`. An audio source with a video aspect
   renders an **audiogram**: a solid `background` (Sermount dark `#0f1115` by default) with the
   captions on it.
-- `captions` is `null` for no burn. `cache` URLs may be `null` (no cache).
+- `captions` is `null` for no burn. `captions.position` is `bottom` (default), `middle` or `top`: the
+  caption's bottom edge sits at 88 %, 56 % or 24 % of the frame height. Lines wrap to the frame's own
+  width less a 6 % margin each side, and the font steps down until the cue fits in two lines.
+- `cache` URLs may be `null` (no cache).
 
 Output (always; the handler never raises):
 

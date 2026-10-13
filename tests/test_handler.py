@@ -331,7 +331,8 @@ def test_video_command_trims_cuts_crops_and_never_stream_copies():
     assert "trim=" not in graph
     assert "select='not(between(t,6.000,7.000))'" in graph and "aselect='not(between(t,6.000,7.000))'" in graph
     assert "crop='min(iw,ih*1080/1920)'" in graph and "scale=1080:1920" in graph
-    assert "overlay=x=(W-w)/2:y=H-h-230:format=yuv420:eof_action=pass" in graph and "shortest" not in graph and "loudnorm" in graph
+    # bottom: the strip's bottom edge 12 % above the frame's (1920 - 248 strip - 230), as before v0.2.0
+    assert "overlay=x=(W-w)/2:y=1442:format=yuv420:eof_action=pass" in graph and "shortest" not in graph and "loudnorm" in graph
     assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "libx264" and "copy" not in cmd
     assert cmd[-2] == "7.000" and cmd[-3] == "-t"
     assert "/t/cap/captions.mov" in cmd and "concat" not in cmd
@@ -491,3 +492,59 @@ def test_real_libx264_render_of_the_sample(tmp_path, monkeypatch):
     assert info["streams"][0]["width"] == 1080 and info["streams"][0]["height"] == 1920
     assert info["streams"][0]["codec_name"] == "h264"
     assert abs(float(info["format"]["duration"]) - 7.0) < 0.3
+
+
+# ── caption position and layout (v0.2.0) ────────────────────────────────────
+
+LONG_CUE = "Draw near to God and he will draw near to you, that we are to humble ourselves before God"
+
+
+def test_caption_anchors_match_the_app():
+    assert handler.CAPTION_ANCHORS == {"bottom": 0.88, "middle": 0.56, "top": 0.24}
+    app_captions = os.path.join(os.path.dirname(ROOT), "sermount-web", "app", "clip_captions.py")
+    if os.path.exists(app_captions):  # the sibling checkout, when there is one
+        assert 'CAPTION_ANCHORS = {"bottom": 0.88, "middle": 0.56, "top": 0.24}' in open(app_captions).read()
+
+
+@pytest.mark.parametrize("position,anchor", [("bottom", 0.88), ("middle", 0.56), ("top", 0.24)])
+@pytest.mark.parametrize("aspect,width,height,kind", [("9:16", 1080, 1920, "youtube"), ("1:1", 1080, 1080, "youtube"),
+                                                      ("16:9", 1920, 1080, "youtube"), ("9:16", 1080, 1920, "audio")])
+def test_caption_strip_sits_on_the_position_anchor_for_video_and_audiogram(position, anchor, aspect, width, height, kind):
+    source = ({"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "start": 100.0, "end": 108.0} if kind == "youtube"
+              else {"kind": "audio", "audio_url": "https://supabase.test/a.mp3?token=T", "start": 100.0, "end": 108.0})
+    job = handler.validate_input(_job(source=source, aspect=aspect, width=width, height=height,
+                                      captions={"cues": _job()["captions"]["cues"], "position": position}))
+    assert job["caption_position"] == position
+    cmd = handler.build_ffmpeg_cmd(job, "/tmp/src.mp4", 90.0, "/tmp/out.mp4", "/tmp/cap.mov", "libx264")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    y = int(round(height * anchor)) - handler.caption_strip_height(height)
+    assert f"[cap]overlay=x=(W-w)/2:y={y}:" in graph
+    assert 0 <= y and y + handler.caption_strip_height(height) <= height
+
+
+def test_caption_position_is_validated_and_defaults_to_bottom():
+    assert handler.validate_input(_job())["caption_position"] == "bottom"
+    with pytest.raises(handler.ClipError):
+        handler.validate_input(_job(captions={"cues": _job()["captions"]["cues"], "position": "left"}))
+
+
+@pytest.mark.parametrize("width,height", [(1080, 1920), (1080, 1080), (1920, 1080)])
+@pytest.mark.parametrize("text", [LONG_CUE, "short line", "Supercalifragilisticexpialidocious words everywhere " * 2])
+def test_no_caption_line_exceeds_the_frame_less_the_margin(width, height, text):
+    """The 9:16 overflow (render 7, 2026-10-12): every laid-out line fits the
+    frame width minus both side margins, in at most two lines."""
+    font_px, font, lines, widths = handler.layout_caption(" ".join(text.split()), width, height)
+    margin = int(round(width * handler.CAPTION_SIDE_MARGIN))
+    assert 1 <= len(lines) <= 2
+    assert all(w <= width - 2 * margin for w in widths), (widths, width)
+    assert " ".join(lines).split() == text.split()   # nothing dropped
+
+
+def test_drawn_caption_pill_stays_inside_the_9x16_frame(tmp_path):
+    from PIL import Image
+    png = tmp_path / "cap.png"
+    w, h = handler.draw_caption_png(str(png), LONG_CUE, 3, 1080, 1920)
+    alpha = Image.open(png).split()[-1]
+    box = alpha.getbbox()
+    margin = int(round(1080 * handler.CAPTION_SIDE_MARGIN))
+    assert box[0] >= margin - 1 and box[2] <= 1080 - margin + 1, box

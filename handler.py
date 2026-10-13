@@ -8,7 +8,8 @@ holds a database or storage key):
      "cache": {"get_url": "<signed GET or null>", "put_url": "<signed PUT or null>", "token": "..."},
      "output": {"put_url": "<signed PUT>", "token": "...", "container": "mp4" | "m4a"},
      "aspect": "9:16", "width": 1080, "height": 1920,
-     "captions": {"cues": [{"s": 0.0, "e": 2.1, "words": [{"w": "I", "s": 0.0, "e": 0.2}]}]} | null,
+     "captions": {"cues": [{"s": 0.0, "e": 2.1, "words": [{"w": "I", "s": 0.0, "e": 0.2}]}],
+                  "position": "bottom" | "middle" | "top"} | null,
      "edits": {"removed": [[12.4, 13.1]]},
      "normalize_audio": true,
      "max_output_seconds": 1200,
@@ -37,8 +38,11 @@ Rules (from SermonVault's measured findings, docs/edit-mode-clips-brief.md):
   - Captions are drawn by Pillow into PNG strips (one per spoken-word state)
     and composited with `overlay`, so the burn needs neither libass nor
     freetype in ffmpeg and the layout lives in Python, where the app's page
-    mirrors it: bold sans, dark pill, current word in the accent colour,
-    bottom third, two lines split at the space nearest the middle.
+    mirrors it: bold sans, dark pill, current word in the accent colour, at
+    captions.position (bottom | middle | top), two lines split at the space
+    nearest the middle. Lines are measured in pixels against the frame's own
+    width less a side margin, and the font steps down until two lines fit,
+    so a 9:16 frame wraps narrower than a 16:9 one.
   - Logs: counts, timings, encoder and reason only. Never URLs, caption text
     or words. Every temp file is deleted in a `finally`.
 """
@@ -59,7 +63,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.1.2"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.0"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -72,6 +76,12 @@ ACCENT = "#B8842E"
 CAPTION_TEXT = "#F6F3EC"
 CAPTION_PILL = (15, 17, 21, 210)
 CAPTION_MAX_CHARS = 84
+# Caption position: the caption's BOTTOM edge at this fraction of the frame
+# height, from the top. Same literals as the app's app/clip_captions.py
+# CAPTION_ANCHORS (and edit-mode.js, which previews it).
+CAPTION_ANCHORS = {"bottom": 0.88, "middle": 0.56, "top": 0.24}
+CAPTION_SIDE_MARGIN = 0.06     # of the frame width, each side; no line reaches closer to the edge
+CAPTION_MIN_FONT_PX = 18
 FONT_CANDIDATES = (
     os.environ.get("CAPTION_FONT", ""),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -179,6 +189,9 @@ def validate_input(job_input):
     if captions is not None:
         if not isinstance(captions, dict) or not isinstance(captions.get("cues"), list):
             raise ClipError("input")
+        position = captions.get("position", "bottom")
+        if position not in CAPTION_ANCHORS:
+            raise ClipError("input")
         cues = []
         for c in captions["cues"]:
             if not isinstance(c, dict) or not _finite(c.get("s")) or not _finite(c.get("e")) or c["e"] <= c["s"]:
@@ -192,6 +205,8 @@ def validate_input(job_input):
                     raise ClipError("input")
                 ws.append({"w": w["w"], "s": float(w["s"]), "e": float(w["e"])})
             cues.append({"s": float(c["s"]), "e": float(c["e"]), "words": ws})
+    if captions is None:
+        position = "bottom"
     max_out = job_input.get("max_output_seconds", 1200)
     if not _finite(max_out) or max_out <= 0:
         raise ClipError("input")
@@ -205,7 +220,7 @@ def validate_input(job_input):
         "cache_get": cache.get("get_url"), "cache_put": cache.get("put_url"), "cache_token": cache.get("token"),
         "out_put": out["put_url"], "out_token": out.get("token"), "container": out["container"],
         "aspect": aspect, "width": width, "height": height,
-        "removed": removed, "cues": cues,
+        "removed": removed, "cues": cues, "caption_position": position,
         "normalize_audio": bool(job_input.get("normalize_audio", True)),
         "max_output_seconds": float(max_out),
         "background": background,
@@ -327,6 +342,46 @@ def _font(size):
         return ImageFont.load_default()
 
 
+def _line_width(font, words):
+    return sum(font.getlength(w) for w in words) + font.getlength(" ") * max(0, len(words) - 1)
+
+
+def _wrap(words, font, max_w):
+    lines, cur = [], []
+    for w in words:
+        if cur and _line_width(font, cur + [w]) > max_w:
+            lines.append(cur)
+            cur = [w]
+        else:
+            cur = cur + [w]
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def layout_caption(text, width, height):
+    """(font_px, font, lines, line_widths) for one caption on a frame of this
+    size. The house split (two lines at the space nearest the middle) when
+    both halves fit inside width - 2 x side margin - the pill's padding;
+    otherwise a greedy wrap; and while that still needs more than two lines
+    or a word does not fit, the font steps down (never below
+    CAPTION_MIN_FONT_PX). The 9:16 overflow (2026-10-12, render 7) was a font
+    sized from the height and a split by character count."""
+    words = text.split()
+    margin = int(round(width * CAPTION_SIDE_MARGIN))
+    font_px = max(CAPTION_MIN_FONT_PX, int(round(height * 0.038)))
+    while True:
+        font = _font(font_px)
+        max_w = width - 2 * margin - 2 * int(font_px * 0.6)
+        lines = [ln.split() for ln in split_lines(text)]
+        if not all(_line_width(font, ln) <= max_w for ln in lines):
+            lines = _wrap(words, font, max_w)
+        fits = len(lines) <= 2 and all(_line_width(font, ln) <= max_w for ln in lines)
+        if fits or font_px <= CAPTION_MIN_FONT_PX:
+            return font_px, font, [" ".join(ln) for ln in lines], [_line_width(font, ln) for ln in lines]
+        font_px = max(CAPTION_MIN_FONT_PX, int(font_px * 0.92))
+
+
 def caption_strip_height(height):
     """Every strip is the two-line pill height, so the strips make one
     constant-size video track; a one-line caption sits on the same baseline."""
@@ -338,12 +393,10 @@ def caption_strip_height(height):
 def draw_caption_png(path, text, current, width, height):
     """Draw one caption state: the pill with up to two centred lines, the
     current word in the accent colour, bottom-aligned in a strip of
-    caption_strip_height(). The compositor places the strip in the bottom
-    third."""
+    caption_strip_height(). The compositor puts the strip's bottom edge at
+    the position's anchor."""
     from PIL import Image, ImageDraw
-    font_px = max(18, int(round(height * 0.038)))
-    font = _font(font_px)
-    lines = split_lines(text)
+    font_px, font, lines, line_widths = layout_caption(text, width, height)
     pad_x, pad_y, gap = int(font_px * 0.6), int(font_px * 0.35), int(font_px * 0.22)
     space_w = font.getlength(" ")
     line_h = int(font_px * 1.25)
@@ -351,7 +404,6 @@ def draw_caption_png(path, text, current, width, height):
     pill_h = pad_y * 2 + line_h * len(lines) + gap * (len(lines) - 1)
     img = Image.new("RGBA", (width, strip_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    line_widths = [sum(font.getlength(w) for w in ln.split()) + space_w * (len(ln.split()) - 1) for ln in lines]
     pill_w = min(width - 4, int(max(line_widths) if line_widths else 0) + pad_x * 2)
     x0 = (width - pill_w) // 2
     top = strip_h - pill_h
@@ -441,6 +493,12 @@ def video_codec_args(encoder):
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"]
 
 
+def caption_y(position, height):
+    """The strip's top row: its bottom edge (the pill's bottom) on the anchor."""
+    anchor = CAPTION_ANCHORS.get(position, CAPTION_ANCHORS["bottom"])
+    return max(0, int(round(height * anchor)) - caption_strip_height(height))
+
+
 def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, encoder):
     """The full argv. `file_origin` is the source clock time at the file's
     first sample (the padded range start for a fetched YouTube range, 0 for
@@ -492,13 +550,13 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
         cap_input_index = 1
     if caption_track:
         cmd += ["-i", caption_track]
-        margin = int(height * 0.12)
+        cap_y = caption_y(job.get("caption_position", "bottom"), height)
         graph.append("[0:v]" + ",".join(video_chain) + "[vb]")
         graph.append(f"[{cap_input_index}:v]format=rgba[cap]")
         # yuv420 out of the overlay, then an explicit format: libx264 refuses
         # the alpha-carrying format the overlay would otherwise pick.
         # eof_action=pass, never shortest=1; -t caps the length.
-        graph.append(f"[vb][cap]overlay=x=(W-w)/2:y=H-h-{margin}:format=yuv420:eof_action=pass,format=yuv420p[v]")
+        graph.append(f"[vb][cap]overlay=x=(W-w)/2:y={cap_y}:format=yuv420:eof_action=pass,format=yuv420p[v]")
     else:
         graph.append("[0:v]" + ",".join(video_chain) + "[v]")
     cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
