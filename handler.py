@@ -65,7 +65,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.2.0"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.1"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -84,6 +84,12 @@ CAPTION_MAX_CHARS = 84
 CAPTION_ANCHORS = {"bottom": 0.88, "middle": 0.56, "top": 0.24}
 CAPTION_SIDE_MARGIN = 0.06     # of the frame width, each side; no line reaches closer to the edge
 CAPTION_MIN_FONT_PX = 18
+# v0.2.1: ONE caption size per format, a fraction of the frame height (same
+# numbers as the app's app/clip_captions.py CAPTION_FONT_FRAC). The app cuts
+# cues to fit two lines at this size; a third line is the fallback, and the
+# font only shrinks for a single word wider than the frame.
+CAPTION_FONT_FRAC = {"9:16": 0.034, "1:1": 0.046, "16:9": 0.046}
+CAPTION_MAX_LINES = 3
 FONT_CANDIDATES = (
     os.environ.get("CAPTION_FONT", ""),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -99,7 +105,8 @@ FONT_REGULAR_CANDIDATES = (
 )
 IDENTITY_TEXT_MAX = 200
 LOGO_MAX_BYTES = 5 * 1024 * 1024
-WAVE_COLOUR = "0xB8842E@0.55"      # the house accent, at reduced opacity
+WAVE_COLOUR = "0xB8842E@0.85"      # the house accent; 0.55 was nearly invisible on render 11
+WAVE_HEIGHT_FRAC = 0.12            # of the frame height, inside the largest free span
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
@@ -170,6 +177,15 @@ def validate_input(job_input):
         raise ClipError("input")
     if src["kind"] == "audio" and not _url_ok(src.get("audio_url")):
         raise ClipError("input")
+    # v0.2.1: the app sends the exact cached window it keyed the cache by,
+    # so a cached file's first second is the same for every render sharing
+    # the key. It must cover the range; absent, the window is derived as before.
+    fetch = None
+    if src["kind"] == "youtube" and ("fetch_start" in src or "fetch_end" in src):
+        fs, fe = src.get("fetch_start"), src.get("fetch_end")
+        if not _finite(fs) or not _finite(fe) or fs < 0 or fs > start or fe < end or fe - fs > (end - start) + 3 * PAD_SECS:
+            raise ClipError("input")
+        fetch = (float(fs), float(fe))
     out = job_input.get("output")
     if not isinstance(out, dict) or not _url_ok(out.get("put_url")) or out.get("container") not in ("mp4", "m4a"):
         raise ClipError("input")
@@ -243,7 +259,7 @@ def validate_input(job_input):
     return {
         "kind": src["kind"],
         "url": src.get("url") if src["kind"] == "youtube" else src.get("audio_url"),
-        "start": float(start), "end": float(end),
+        "start": float(start), "end": float(end), "fetch": fetch,
         "cache_get": cache.get("get_url"), "cache_put": cache.get("put_url"), "cache_token": cache.get("token"),
         "out_put": out["put_url"], "out_token": out.get("token"), "container": out["container"],
         "aspect": aspect, "width": width, "height": height,
@@ -386,35 +402,48 @@ def _wrap(words, font, max_w):
     return lines
 
 
+def caption_format(width, height):
+    """The output format of a frame size: 9:16, 1:1 or 16:9."""
+    if height > width * 1.2:
+        return "9:16"
+    return "1:1" if width <= height * 1.2 else "16:9"
+
+
+def caption_font_px(width, height):
+    """The format's one caption size."""
+    return max(CAPTION_MIN_FONT_PX, int(round(height * CAPTION_FONT_FRAC[caption_format(width, height)])))
+
+
 def layout_caption(text, width, height):
     """(font_px, font, lines, line_widths) for one caption on a frame of this
-    size. The house split (two lines at the space nearest the middle) when
-    both halves fit inside width - 2 x side margin - the pill's padding;
-    otherwise a greedy wrap; and while that still needs more than two lines
-    or a word does not fit, the font steps down (never below
-    CAPTION_MIN_FONT_PX). The 9:16 overflow (2026-10-12, render 7) was a font
-    sized from the height and a split by character count."""
+    size, at the format's fixed size: the house split (two lines at the
+    space nearest the middle) when both halves fit inside width − 2 × side
+    margin − the pill's padding, otherwise a greedy wrap, which may take a
+    third line. The size only steps down when a single word is wider than
+    the frame (or a cue the app did not cut would need a fourth line). v0.2.0
+    shrank every long cue, so short cues read large and long ones small."""
     words = text.split()
     margin = int(round(width * CAPTION_SIDE_MARGIN))
-    font_px = max(CAPTION_MIN_FONT_PX, int(round(height * 0.038)))
+    font_px = caption_font_px(width, height)
     while True:
         font = _font(font_px)
         max_w = width - 2 * margin - 2 * int(font_px * 0.6)
         lines = [ln.split() for ln in split_lines(text)]
         if not all(_line_width(font, ln) <= max_w for ln in lines):
             lines = _wrap(words, font, max_w)
-        fits = len(lines) <= 2 and all(_line_width(font, ln) <= max_w for ln in lines)
+        fits = len(lines) <= CAPTION_MAX_LINES and all(_line_width(font, ln) <= max_w for ln in lines)
         if fits or font_px <= CAPTION_MIN_FONT_PX:
             return font_px, font, [" ".join(ln) for ln in lines], [_line_width(font, ln) for ln in lines]
         font_px = max(CAPTION_MIN_FONT_PX, int(font_px * 0.92))
 
 
-def caption_strip_height(height):
-    """Every strip is the two-line pill height, so the strips make one
-    constant-size video track; a one-line caption sits on the same baseline."""
-    font_px = max(18, int(round(height * 0.038)))
+def caption_strip_height(width, height):
+    """Every strip is the tallest pill the format can draw (CAPTION_MAX_LINES
+    at its fixed size), so the strips make one constant-size video track and
+    every caption sits on the same baseline (the strip's bottom)."""
+    font_px = caption_font_px(width, height)
     pad_y, gap, line_h = int(font_px * 0.35), int(font_px * 0.22), int(font_px * 1.25)
-    return pad_y * 2 + line_h * 2 + gap
+    return pad_y * 2 + line_h * CAPTION_MAX_LINES + gap * (CAPTION_MAX_LINES - 1)
 
 
 def draw_caption_png(path, text, current, width, height):
@@ -427,7 +456,7 @@ def draw_caption_png(path, text, current, width, height):
     pad_x, pad_y, gap = int(font_px * 0.6), int(font_px * 0.35), int(font_px * 0.22)
     space_w = font.getlength(" ")
     line_h = int(font_px * 1.25)
-    strip_h = caption_strip_height(height)
+    strip_h = caption_strip_height(width, height)
     pill_h = pad_y * 2 + line_h * len(lines) + gap * (len(lines) - 1)
     img = Image.new("RGBA", (width, strip_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -460,7 +489,7 @@ def write_caption_track(tmp, states, out_len, width, height):
     from PIL import Image
     cap_dir = os.path.join(tmp, "cap")
     os.makedirs(cap_dir, exist_ok=True)
-    strip_h = caption_strip_height(height)
+    strip_h = caption_strip_height(width, height)
     blank = os.path.join(cap_dir, "blank.png")
     Image.new("RGBA", (width, strip_h), (0, 0, 0, 0)).save(blank, "PNG")
     entries = []
@@ -594,7 +623,7 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
     blocked = []
     if captions_on:
         y1 = int(round(H * CAPTION_ANCHORS.get(caption_position, CAPTION_ANCHORS["bottom"])))
-        band = (max(0, y1 - caption_strip_height(H)), y1)
+        band = (max(0, y1 - caption_strip_height(W, H)), y1)
         blocked.append((band[0] - gap, band[1] + gap))
     meta_text = " · ".join(x for x in (identity.get("speaker"), identity.get("date")) if x)
     title_text = identity.get("title") or ""
@@ -715,7 +744,7 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
     spans = sorted(_free(top_safe, H - bottom_safe, taken), key=lambda s: s[1] - s[0], reverse=True)
     if spans and spans[0][1] - spans[0][0] >= int(H * 0.05):
         s0, s1 = spans[0]
-        wh = min(int(H * (0.14 if tall else 0.18)), s1 - s0)
+        wh = min(int(H * WAVE_HEIGHT_FRAC), s1 - s0)
         wh -= wh % 2
         wy = s0 + (s1 - s0 - wh) // 2
         wy -= wy % 2
@@ -790,10 +819,10 @@ def draw_identity_background(path, width, height, background, identity, caption_
     return layout
 
 
-def caption_y(position, height):
+def caption_y(position, width, height):
     """The strip's top row: its bottom edge (the pill's bottom) on the anchor."""
     anchor = CAPTION_ANCHORS.get(position, CAPTION_ANCHORS["bottom"])
-    return max(0, int(round(height * anchor)) - caption_strip_height(height))
+    return max(0, int(round(height * anchor)) - caption_strip_height(width, height))
 
 
 def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, encoder):
@@ -822,7 +851,7 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
         # The waveform reads the cut audio before loudnorm (which resamples).
         graph = [f"[{audio_src}]" + ",".join(cut_chain + ["asplit=2"]) + "[ap][aw]",
                  "[ap]" + ",".join(level_chain or ["anull"]) + "[a]",
-                 f"[aw]showwaves=s={wave[2] - wave[0]}x{wave[3] - wave[1]}:mode=cline:rate=30:colors={WAVE_COLOUR},format=rgba[wave]"]
+                 f"[aw]showwaves=s={wave[2] - wave[0]}x{wave[3] - wave[1]}:mode=cline:scale=sqrt:rate=30:colors={WAVE_COLOUR},format=rgba[wave]"]
     else:
         graph = [f"[{audio_src}]" + ",".join(cut_chain + level_chain or ["anull"]) + "[a]"]
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin"]
@@ -857,7 +886,7 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
         base = f"{base}[bg0];[bg0][wave]overlay=x={wave[0]}:y={wave[1]}:eof_action=pass,format=yuv420p"
     if caption_track:
         cmd += ["-i", caption_track]
-        cap_y = caption_y(job.get("caption_position", "bottom"), height)
+        cap_y = caption_y(job.get("caption_position", "bottom"), width, height)
         graph.append(base + "[vb]")
         graph.append(f"[{cap_input_index}:v]format=rgba[cap]")
         # yuv420 out of the overlay, then an explicit format: libx264 refuses
@@ -1035,7 +1064,7 @@ def fetch_source(job, tmp):
         path = os.path.join(tmp, "source.audio")
         size = download(job["url"], path)
         return path, 0.0, False, size
-    rs, re_ = padded_range(job["start"], job["end"])
+    rs, re_ = job.get("fetch") or padded_range(job["start"], job["end"])
     path = os.path.join(tmp, "source.mp4")
     if job["cache_get"]:
         try:

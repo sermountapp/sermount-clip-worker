@@ -35,8 +35,12 @@ Input (`POST /v2/{endpoint_id}/run`, body `{"input": ...}`):
   renders an **audiogram**: a solid `background` (Sermount dark `#0f1115` by default) with the
   captions on it.
 - `captions` is `null` for no burn. `captions.position` is `bottom` (default), `middle` or `top`: the
-  caption's bottom edge sits at 88 %, 56 % or 24 % of the frame height. Lines wrap to the frame's own
-  width less a 6 % margin each side, and the font steps down until the cue fits in two lines.
+  caption's bottom edge sits at 88 %, 56 % or 24 % of the frame height. One caption size per format
+  (3.4 % of the height at 9:16, 4.6 % at 1:1 and 16:9; the app cuts cues to fit two lines at it). Lines
+  wrap to the frame's own width less a 6 % margin each side, a third line is the fallback, and the size
+  only shrinks for a single word wider than the frame.
+- `source.fetch_start` / `fetch_end` (YouTube): the exact window the app keyed the cache by. The worker
+  fetches and timestamps by it, so every render sharing a cached range agrees on its first second.
 - `cache` URLs may be `null` (no cache).
 - `identity` (audio sermons rendered as video, the audiogram): `logo_url` (a short signed GET or `null`),
   `church_name`, `title`, `speaker`, `date`. The worker draws them on the house background with

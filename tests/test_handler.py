@@ -331,8 +331,8 @@ def test_video_command_trims_cuts_crops_and_never_stream_copies():
     assert "trim=" not in graph
     assert "select='not(between(t,6.000,7.000))'" in graph and "aselect='not(between(t,6.000,7.000))'" in graph
     assert "crop='min(iw,ih*1080/1920)'" in graph and "scale=1080:1920" in graph
-    # bottom: the strip's bottom edge 12 % above the frame's (1920 - 248 strip - 230), as before v0.2.0
-    assert "overlay=x=(W-w)/2:y=1442:format=yuv420:eof_action=pass" in graph and "shortest" not in graph and "loudnorm" in graph
+    # bottom: the strip's bottom edge 12 % above the frame's (1690 − the three-line strip at 65 px)
+    assert f"overlay=x=(W-w)/2:y={1690 - handler.caption_strip_height(1080, 1920)}:format=yuv420:eof_action=pass" in graph and "shortest" not in graph and "loudnorm" in graph
     assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "libx264" and "copy" not in cmd
     assert cmd[-2] == "7.000" and cmd[-3] == "-t"
     assert "/t/cap/captions.mov" in cmd and "concat" not in cmd
@@ -517,9 +517,9 @@ def test_caption_strip_sits_on_the_position_anchor_for_video_and_audiogram(posit
     assert job["caption_position"] == position
     cmd = handler.build_ffmpeg_cmd(job, "/tmp/src.mp4", 90.0, "/tmp/out.mp4", "/tmp/cap.mov", "libx264")
     graph = cmd[cmd.index("-filter_complex") + 1]
-    y = int(round(height * anchor)) - handler.caption_strip_height(height)
+    y = int(round(height * anchor)) - handler.caption_strip_height(width, height)
     assert f"[cap]overlay=x=(W-w)/2:y={y}:" in graph
-    assert 0 <= y and y + handler.caption_strip_height(height) <= height
+    assert 0 <= y and y + handler.caption_strip_height(width, height) <= height
 
 
 def test_caption_position_is_validated_and_defaults_to_bottom():
@@ -532,10 +532,11 @@ def test_caption_position_is_validated_and_defaults_to_bottom():
 @pytest.mark.parametrize("text", [LONG_CUE, "short line", "Supercalifragilisticexpialidocious words everywhere " * 2])
 def test_no_caption_line_exceeds_the_frame_less_the_margin(width, height, text):
     """The 9:16 overflow (render 7, 2026-10-12): every laid-out line fits the
-    frame width minus both side margins, in at most two lines."""
+    frame width minus both side margins, in at most three lines (two is the
+    app's target; three the fallback)."""
     font_px, font, lines, widths = handler.layout_caption(" ".join(text.split()), width, height)
     margin = int(round(width * handler.CAPTION_SIDE_MARGIN))
-    assert 1 <= len(lines) <= 2
+    assert 1 <= len(lines) <= 3
     assert all(w <= width - 2 * margin for w in widths), (widths, width)
     assert " ".join(lines).split() == text.split()   # nothing dropped
 
@@ -657,3 +658,60 @@ def test_real_audiogram_render_draws_the_logo_and_the_title(tmp_path, monkeypatc
     strip = img.crop((tx0, ty0, tx1, ty1)).convert("L")
     assert max(strip.getdata()) > 200                          # the title's light text
     assert img.getpixel((5, 5))[0] < 40                        # the house colour in the corner
+
+
+
+def test_caption_size_is_fixed_per_format_long_and_short_cues_alike():
+    """v0.2.1 (renders 10 / 11): one size per format; a long cue wraps to
+    more lines instead of shrinking. Only a word wider than the frame
+    shrinks it."""
+    for (w, h), frac in (((1080, 1920), 0.034), ((1080, 1080), 0.046), ((1920, 1080), 0.046)):
+        size = round(h * frac)
+        short = handler.layout_caption("Grace and peace", w, h)
+        long_ = handler.layout_caption("Draw near to God and he will draw near to you, humble yourselves", w, h)
+        assert short[0] == long_[0] == size, (w, h, short[0], long_[0])
+        assert len(long_[2]) >= 2
+    wide = handler.layout_caption("Pneumonoultramicroscopicsilicovolcanoconiosis", 1080, 1920)
+    assert wide[0] < round(1920 * 0.034) and wide[3][0] <= 1080 - 2 * round(1080 * 0.06)
+
+
+def test_caption_fractions_match_the_app():
+    assert handler.CAPTION_FONT_FRAC == {"9:16": 0.034, "1:1": 0.046, "16:9": 0.046}
+    app_captions = os.path.join(os.path.dirname(ROOT), "sermount-web", "app", "clip_captions.py")
+    if os.path.exists(app_captions):
+        assert 'CAPTION_FONT_FRAC = {"9:16": 0.034, "1:1": 0.046, "16:9": 0.046}' in open(app_captions).read()
+
+
+def test_waveform_is_twelve_percent_high_and_strong_enough_to_see():
+    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "bottom", True, (600, 300))
+    x0, y0, x1, y1 = layout["wave"]
+    assert y1 - y0 == int(1920 * 0.12) - int(1920 * 0.12) % 2
+    assert handler.WAVE_COLOUR == "0xB8842E@0.85"
+    audio = {"kind": "audio", "audio_url": "https://supabase.test/a.mp3?token=T", "start": 1.0, "end": 8.0}
+    job = dict(handler.validate_input(_job(source=audio, identity=IDENTITY)), identity_bg="/tmp/i.png", wave_box=layout["wave"])
+    graph = handler.build_ffmpeg_cmd(job, "/tmp/a.m4a", 0.0, "/tmp/o.mp4", None, "libx264")
+    assert "mode=cline:scale=sqrt" in graph[graph.index("-filter_complex") + 1]
+
+
+
+def test_the_fetch_window_from_the_app_is_the_cached_files_origin(quiet, monkeypatch):
+    """v0.2.1: the app's cache key and the worker's file origin come from the
+    same window. Before, the worker used floor(start − 10) of each job's own
+    start, so two renders sharing a key (a nudge, or the v1.1 lead-in on a
+    range cached before it) could place the clip up to a second off."""
+    events = []
+    monkeypatch.setattr(handler, "fetch_youtube_range", lambda url, out, rs, re_: (events.append((rs, re_)), shutil.copyfile(SAMPLE, out)))
+    monkeypatch.setattr(handler, "download", lambda *a, **k: (_ for _ in ()).throw(handler.ClipError("fetch")))
+    job = handler.validate_input(_job(source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                              "start": 189.75, "end": 194.25, "fetch_start": 180, "fetch_end": 205}))
+    path, origin, hit, size = handler.fetch_source(job, str(handler.tempfile.mkdtemp()))
+    assert events == [(180.0, 205.0)] and origin == 180.0
+    # without a window (an older app) the derived one, as before
+    job = handler.validate_input(_job(source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "start": 189.75, "end": 194.25}))
+    handler.fetch_source(job, str(handler.tempfile.mkdtemp()))
+    assert events[-1] == (179, 205)
+    for bad in ({"fetch_start": 190, "fetch_end": 205}, {"fetch_start": 180, "fetch_end": 194}, {"fetch_start": "x", "fetch_end": 205},
+                {"fetch_start": 100, "fetch_end": 205}):
+        with pytest.raises(handler.ClipError):
+            handler.validate_input(_job(source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                                "start": 189.75, "end": 194.25, **bad}))
