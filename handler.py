@@ -13,7 +13,9 @@ holds a database or storage key):
      "edits": {"removed": [[12.4, 13.1]]},
      "normalize_audio": true,
      "max_output_seconds": 1200,
-     "background": "#0f1115"}
+     "background": "#0f1115",
+     "identity": {"logo_url": "<signed GET or null>", "church_name", "title", "speaker", "date"} | null}
+                  (audio sermons in a video format only: the audiogram's identity stack)
 
 Times inside `source` are on that source's own clock (YouTube full-video time
 for youtube, stored-audio time for audio). `edits.removed` and caption cues
@@ -88,6 +90,16 @@ FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/Library/Fonts/Arial Bold.ttf",
 )
+# The identity stack's quiet face (speaker · date); the display face is the caption font.
+FONT_REGULAR_CANDIDATES = (
+    os.environ.get("IDENTITY_FONT_REGULAR", ""),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+)
+IDENTITY_TEXT_MAX = 200
+LOGO_MAX_BYTES = 5 * 1024 * 1024
+WAVE_COLOUR = "0xB8842E@0.55"      # the house accent, at reduced opacity
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
@@ -207,6 +219,21 @@ def validate_input(job_input):
             cues.append({"s": float(c["s"]), "e": float(c["e"]), "words": ws})
     if captions is None:
         position = "bottom"
+    identity = None
+    raw_identity = job_input.get("identity")
+    if raw_identity is not None and src["kind"] == "audio" and aspect != "audio":
+        if not isinstance(raw_identity, dict):
+            raise ClipError("input")
+        identity = {}
+        for k in ("church_name", "title", "speaker", "date"):
+            v = raw_identity.get(k)
+            if v is not None and not isinstance(v, str):
+                raise ClipError("input")
+            identity[k] = " ".join((v or "").split())[:IDENTITY_TEXT_MAX] or None
+        logo = raw_identity.get("logo_url")
+        if logo is not None and not _url_ok(logo):
+            raise ClipError("input")
+        identity["logo_url"] = logo
     max_out = job_input.get("max_output_seconds", 1200)
     if not _finite(max_out) or max_out <= 0:
         raise ClipError("input")
@@ -220,7 +247,7 @@ def validate_input(job_input):
         "cache_get": cache.get("get_url"), "cache_put": cache.get("put_url"), "cache_token": cache.get("token"),
         "out_put": out["put_url"], "out_token": out.get("token"), "container": out["container"],
         "aspect": aspect, "width": width, "height": height,
-        "removed": removed, "cues": cues, "caption_position": position,
+        "removed": removed, "cues": cues, "caption_position": position, "identity": identity,
         "normalize_audio": bool(job_input.get("normalize_audio", True)),
         "max_output_seconds": float(max_out),
         "background": background,
@@ -328,9 +355,9 @@ def caption_states(cues, removed, out_len):
     return [st for st in states if st["e"] > st["s"]]
 
 
-def _font(size):
+def _font(size, regular=False):
     from PIL import ImageFont
-    for path in FONT_CANDIDATES:
+    for path in (FONT_REGULAR_CANDIDATES if regular else FONT_CANDIDATES):
         if path and os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size)
@@ -493,6 +520,276 @@ def video_codec_args(encoder):
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"]
 
 
+# ── audiogram identity stack ─────────────────────────────────────────────────
+# An audio sermon has no picture, so its video formats draw who and what
+# this is on the house background: the church's logo (or its name set in the
+# display face), the sermon title, and speaker · date, plus a waveform from
+# the clip's audio. The stack never enters the caption band at any of the
+# three caption positions (layout below is pure, so the tests can check
+# every aspect x position); captions stay the only element with a pill.
+
+def _free(lo, hi, blocked):
+    """[lo, hi] minus the blocked (y0, y1) spans, as a list of (y0, y1)."""
+    spans = [(lo, hi)]
+    for b0, b1 in sorted(blocked):
+        nxt = []
+        for a0, a1 in spans:
+            if b1 <= a0 or b0 >= a1:
+                nxt.append((a0, a1))
+                continue
+            if b0 > a0:
+                nxt.append((a0, b0))
+            if b1 < a1:
+                nxt.append((b1, a1))
+        spans = nxt
+    return [s for s in spans if s[1] - s[0] > 0]
+
+
+def _fit_text(text, max_w, start_px, min_px, max_lines, regular=False):
+    """(font_px, font, lines): the largest size from start_px down to min_px
+    at which the text wraps into max_lines within max_w. One line never
+    wraps (max_lines=1) and shrinks instead; at min_px whatever does not fit
+    on the last line is cut with an ellipsis rather than overflow."""
+    words = (text or "").split()
+    if not words:
+        return start_px, _font(start_px, regular), []
+    px = start_px
+    while True:
+        font = _font(px, regular)
+        lines = [" ".join(ln) for ln in _wrap(words, font, max_w)]
+        if len(lines) <= max_lines and all(font.getlength(ln) <= max_w for ln in lines):
+            return px, font, lines
+        if px <= min_px:
+            lines = lines[:max_lines]
+            last = lines[-1]
+            while last and font.getlength(last + "…") > max_w:
+                last = last[:-1].rstrip()
+            lines[-1] = last + "…"
+            return px, font, lines
+        px = max(min_px, int(px * 0.92))
+
+
+def _text_block(lines, font, px):
+    line_h = int(px * 1.22)
+    return line_h * len(lines), line_h
+
+
+def audiogram_layout(width, height, identity, caption_position, captions_on, logo_size=None):
+    """Boxes (x0, y0, x1, y1) for one audiogram frame: logo or name, title,
+    meta (speaker · date), wave, and the caption band it must avoid. Text
+    boxes carry their font and lines for the drawing pass. Per aspect:
+      9:16  one centred column (logo, title, meta) from 12 % down;
+      1:1   logo top-left, title and meta to its right;
+      16:9  logo top-left, title and meta as a lower-left block;
+    and the wave across the largest free span that is left. When the
+    captions sit where the stack would go, the stack moves past them."""
+    identity = identity or {}
+    W, H = int(width), int(height)
+    side = int(round(W * CAPTION_SIDE_MARGIN))
+    tall = H > W * 1.2
+    top_safe = int(round(H * (0.12 if tall else 0.07)))
+    bottom_safe = int(round(H * 0.07))
+    gap = int(round(H * 0.02))
+    band = None
+    blocked = []
+    if captions_on:
+        y1 = int(round(H * CAPTION_ANCHORS.get(caption_position, CAPTION_ANCHORS["bottom"])))
+        band = (max(0, y1 - caption_strip_height(H)), y1)
+        blocked.append((band[0] - gap, band[1] + gap))
+    meta_text = " · ".join(x for x in (identity.get("speaker"), identity.get("date")) if x)
+    title_text = identity.get("title") or ""
+    out = {"band": band, "logo": None, "name": None, "title": None, "meta": None, "wave": None}
+
+    def logo_box(max_w, max_h):
+        if not logo_size:
+            return None
+        lw, lh = logo_size
+        scale = min(max_w / lw, max_h / lh, 2.0)
+        return max(1, int(lw * scale)), max(1, int(lh * scale))
+
+    def name_block(max_w, px):
+        npx, nfont, nlines = _fit_text(identity.get("church_name") or "", max_w, px, max(14, int(px * 0.5)), 2)
+        return (npx, nfont, nlines) if nlines else None
+
+    def place(height_needed, from_bottom=False):
+        spans = _free(top_safe, H - bottom_safe, blocked)
+        spans = [s for s in spans if s[1] - s[0] >= height_needed]
+        if not spans:
+            return None
+        s = spans[-1] if from_bottom else spans[0]
+        return s[1] - height_needed if from_bottom else s[0]
+
+    if tall:  # 9:16: one centred column
+        col_w = W - 2 * side
+        parts = []
+        lb = logo_box(W * 0.20, H * 0.09)
+        if lb:
+            parts.append(("logo", lb[1], lb))
+        else:
+            nb = name_block(col_w, int(H * 0.034))
+            if nb:
+                parts.append(("name", _text_block(nb[2], nb[1], nb[0])[0], nb))
+        tb = _fit_text(title_text, col_w, int(H * 0.040), int(H * 0.022), 2)
+        if tb[2]:
+            parts.append(("title", _text_block(tb[2], tb[1], tb[0])[0], tb))
+        mb = _fit_text(meta_text, col_w, int(H * 0.022), int(H * 0.014), 1, regular=True)
+        if mb[2]:
+            parts.append(("meta", _text_block(mb[2], mb[1], mb[0])[0], mb))
+        inner = int(H * 0.018)
+        total = sum(p[1] for p in parts) + inner * max(0, len(parts) - 1)
+        y = place(total)
+        if y is None:
+            y = top_safe
+        for key, h, data in parts:
+            if key == "logo":
+                out["logo"] = ((W - data[0]) // 2, y, (W - data[0]) // 2 + data[0], y + data[1])
+            else:
+                width_used = int(max(data[1].getlength(ln) for ln in data[2]))
+                out[key] = {"box": ((W - width_used) // 2, y, (W + width_used) // 2, y + h),
+                            "px": data[0], "lines": data[2], "align": "center", "regular": key == "meta"}
+            y += h + inner
+    else:
+        square = W <= H * 1.2
+        lb = logo_box(W * (0.18 if square else 0.12), H * (0.14 if square else 0.12))
+        logo_w = lb[0] if lb else 0
+        if square:  # 1:1: one row, logo then the text to its right
+            text_x = side + (logo_w + int(W * 0.03) if lb else 0)
+            text_w = W - side - text_x
+            tb = _fit_text(title_text, text_w, int(H * 0.048), int(H * 0.026), 2)
+            mb = _fit_text(meta_text, text_w, int(H * 0.028), int(H * 0.016), 1, regular=True)
+            nb = None if lb else name_block(text_w, int(H * 0.040))
+            blocks = [b for b in (("name", nb), ("title", tb), ("meta", mb)) if b[1] and b[1][2]]
+            inner = int(H * 0.012)
+            text_h = sum(_text_block(b[1][2], b[1][1], b[1][0])[0] for b in blocks) + inner * max(0, len(blocks) - 1)
+            row_h = max(lb[1] if lb else 0, text_h)
+            y = place(row_h)
+            if y is None:
+                y = top_safe
+            if lb:
+                out["logo"] = (side, y + (row_h - lb[1]) // 2, side + lb[0], y + (row_h - lb[1]) // 2 + lb[1])
+            ty = y + (row_h - text_h) // 2
+            for key, data in blocks:
+                h = _text_block(data[2], data[1], data[0])[0]
+                width_used = int(max(data[1].getlength(ln) for ln in data[2]))
+                out[key] = {"box": (text_x, ty, text_x + width_used, ty + h), "px": data[0], "lines": data[2],
+                            "align": "left", "regular": key == "meta"}
+                ty += h + inner
+        else:  # 16:9: logo (or name) top-left, title and meta lower-left
+            if lb:
+                y = place(lb[1])
+                y = top_safe if y is None else y
+                out["logo"] = (side, y, side + lb[0], y + lb[1])
+                blocked.append((y - gap, y + lb[1] + gap))
+            else:
+                nb = name_block(int(W * 0.45), int(H * 0.050))
+                if nb:
+                    h = _text_block(nb[2], nb[1], nb[0])[0]
+                    y = place(h)
+                    y = top_safe if y is None else y
+                    width_used = int(max(nb[1].getlength(ln) for ln in nb[2]))
+                    out["name"] = {"box": (side, y, side + width_used, y + h), "px": nb[0], "lines": nb[2],
+                                   "align": "left", "regular": False}
+                    blocked.append((y - gap, y + h + gap))
+            text_w = int(W * 0.6)
+            tb = _fit_text(title_text, text_w, int(H * 0.055), int(H * 0.030), 2)
+            mb = _fit_text(meta_text, text_w, int(H * 0.032), int(H * 0.018), 1, regular=True)
+            blocks = [b for b in (("title", tb), ("meta", mb)) if b[1][2]]
+            inner = int(H * 0.012)
+            text_h = sum(_text_block(b[1][2], b[1][1], b[1][0])[0] for b in blocks) + inner * max(0, len(blocks) - 1)
+            y = place(text_h, from_bottom=True)
+            y = (H - bottom_safe - text_h) if y is None else y
+            for key, data in blocks:
+                h = _text_block(data[2], data[1], data[0])[0]
+                width_used = int(max(data[1].getlength(ln) for ln in data[2]))
+                out[key] = {"box": (side, y, side + width_used, y + h), "px": data[0], "lines": data[2],
+                            "align": "left", "regular": key == "meta"}
+                y += h + inner
+
+    # The wave: across the largest free span left between everything else.
+    taken = list(blocked)
+    for key in ("logo", "name", "title", "meta"):
+        v = out[key]
+        if v:
+            b = v if key == "logo" else v["box"]
+            taken.append((b[1] - gap, b[3] + gap))
+    spans = sorted(_free(top_safe, H - bottom_safe, taken), key=lambda s: s[1] - s[0], reverse=True)
+    if spans and spans[0][1] - spans[0][0] >= int(H * 0.05):
+        s0, s1 = spans[0]
+        wh = min(int(H * (0.14 if tall else 0.18)), s1 - s0)
+        wh -= wh % 2
+        wy = s0 + (s1 - s0 - wh) // 2
+        wy -= wy % 2
+        ww = (W - 2 * side) - (W - 2 * side) % 2
+        out["wave"] = (side, wy, side + ww, wy + wh)
+    return out
+
+
+def fetch_logo(url, tmp):
+    """The org's logo to a local file, or None. A logo that cannot be had
+    (expired link, not an image, too large) never fails the render: the
+    church name takes its place."""
+    if not url:
+        return None
+    path = os.path.join(tmp, "logo.img")
+    try:
+        download(url, path)
+        if os.path.getsize(path) > LOGO_MAX_BYTES:
+            return None
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return path
+    except Exception as exc:
+        log.info("logo skipped type=%s", type(exc).__name__)
+        return None
+
+
+def draw_identity_background(path, width, height, background, identity, caption_position, captions_on, logo_path=None):
+    """The audiogram's still frame: house colour, a soft radial glow, then
+    the identity stack from audiogram_layout. Returns the layout (its wave
+    box goes to ffmpeg)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    W, H = int(width), int(height)
+    rgb = tuple(int(background.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    img = Image.new("RGB", (W, H), rgb)
+    # A soft radial glow, drawn small and scaled up: cheap and band-free enough.
+    small = Image.new("RGB", (max(8, W // 8), max(8, H // 8)), rgb)
+    d = ImageDraw.Draw(small)
+    lift = tuple(min(255, c + 22) for c in rgb)
+    sw, sh = small.size
+    d.ellipse([sw * 0.05, sh * 0.25, sw * 0.95, sh * 0.75], fill=lift)
+    small = small.filter(ImageFilter.GaussianBlur(radius=max(2, sw // 5)))
+    img = small.resize((W, H), Image.BICUBIC)
+    logo = None
+    logo_size = None
+    if logo_path:
+        try:
+            logo = Image.open(logo_path).convert("RGBA")
+            logo_size = logo.size
+        except Exception:
+            logo = None
+    layout = audiogram_layout(W, H, identity, caption_position, captions_on, logo_size)
+    canvas = img.convert("RGBA")
+    if logo is not None and layout["logo"]:
+        x0, y0, x1, y1 = layout["logo"]
+        canvas.alpha_composite(logo.resize((x1 - x0, y1 - y0), Image.LANCZOS), (x0, y0))
+    draw = ImageDraw.Draw(canvas)
+    muted = (246, 243, 236, 150)
+    for key in ("name", "title", "meta"):
+        block = layout[key]
+        if not block:
+            continue
+        font = _font(block["px"], block["regular"])
+        line_h = int(block["px"] * 1.22)
+        x0, y0, x1, _ = block["box"]
+        for i, ln in enumerate(block["lines"]):
+            lw = font.getlength(ln)
+            x = x0 + (x1 - x0 - lw) / 2 if block["align"] == "center" else x0
+            draw.text((x, y0 + i * line_h), ln, font=font, fill=muted if key == "meta" else CAPTION_TEXT)
+    canvas.convert("RGB").save(path, "PNG")
+    return layout
+
+
 def caption_y(position, height):
     """The strip's top row: its bottom edge (the pill's bottom) on the anchor."""
     anchor = CAPTION_ANCHORS.get(position, CAPTION_ANCHORS["bottom"])
@@ -516,16 +813,18 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
     removed = job["removed"]
     out_len = output_length(length, removed)
     keep = keep_expr(removed)
-    audio_chain = []
-    if keep:
-        audio_chain += [f"aselect='{keep}'", "asetpts=N/SR/TB"]
-    if job["normalize_audio"]:
-        audio_chain.append("loudnorm=I=-16:TP=-1.5:LRA=11")
-    if not audio_chain:
-        audio_chain.append("anull")
+    cut_chain = [f"aselect='{keep}'", "asetpts=N/SR/TB"] if keep else []
+    level_chain = ["loudnorm=I=-16:TP=-1.5:LRA=11"] if job["normalize_audio"] else []
     audiogram = job["kind"] == "audio" and job["aspect"] != "audio"
     audio_src = "1:a" if audiogram else "0:a"
-    graph = [f"[{audio_src}]" + ",".join(audio_chain) + "[a]"]
+    wave = job.get("wave_box") if audiogram else None
+    if wave:
+        # The waveform reads the cut audio before loudnorm (which resamples).
+        graph = [f"[{audio_src}]" + ",".join(cut_chain + ["asplit=2"]) + "[ap][aw]",
+                 "[ap]" + ",".join(level_chain or ["anull"]) + "[a]",
+                 f"[aw]showwaves=s={wave[2] - wave[0]}x{wave[3] - wave[1]}:mode=cline:rate=30:colors={WAVE_COLOUR},format=rgba[wave]"]
+    else:
+        graph = [f"[{audio_src}]" + ",".join(cut_chain + level_chain or ["anull"]) + "[a]"]
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin"]
     source_in = ["-ss", f"{off:.3f}", "-t", f"{length:.3f}", "-i", source_path]
 
@@ -536,10 +835,15 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
 
     width, height = job["width"], job["height"]
     if audiogram:
-        # Audiogram: a solid background the length of the output under the audio.
-        colour = "0x" + job["background"].lstrip("#")
-        cmd += ["-f", "lavfi", "-i", f"color=c={colour}:s={width}x{height}:r=30:d={out_len:.3f}"] + source_in
-        video_chain = ["format=yuv420p"]
+        # Audiogram: the identity background (house colour, gradient, logo,
+        # title, speaker · date) held for the length of the output, or a
+        # solid colour when there is none; the waveform goes over it.
+        if job.get("identity_bg"):
+            cmd += ["-loop", "1", "-framerate", "30", "-t", f"{out_len:.3f}", "-i", job["identity_bg"]] + source_in
+        else:
+            colour = "0x" + job["background"].lstrip("#")
+            cmd += ["-f", "lavfi", "-i", f"color=c={colour}:s={width}x{height}:r=30:d={out_len:.3f}"] + source_in
+        video_chain = ["format=rgba"] if wave else ["format=yuv420p"]
         cap_input_index = 2
     else:
         cmd += source_in
@@ -548,17 +852,20 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
             video_chain += [f"select='{keep}'", "setpts=N/FRAME_RATE/TB"]
         video_chain += [crop_filter(width, height), "format=yuv420p"]
         cap_input_index = 1
+    base = "[0:v]" + ",".join(video_chain)
+    if wave:
+        base = f"{base}[bg0];[bg0][wave]overlay=x={wave[0]}:y={wave[1]}:eof_action=pass,format=yuv420p"
     if caption_track:
         cmd += ["-i", caption_track]
         cap_y = caption_y(job.get("caption_position", "bottom"), height)
-        graph.append("[0:v]" + ",".join(video_chain) + "[vb]")
+        graph.append(base + "[vb]")
         graph.append(f"[{cap_input_index}:v]format=rgba[cap]")
         # yuv420 out of the overlay, then an explicit format: libx264 refuses
         # the alpha-carrying format the overlay would otherwise pick.
         # eof_action=pass, never shortest=1; -t caps the length.
         graph.append(f"[vb][cap]overlay=x=(W-w)/2:y={cap_y}:format=yuv420:eof_action=pass,format=yuv420p[v]")
     else:
-        graph.append("[0:v]" + ",".join(video_chain) + "[v]")
+        graph.append(base + "[v]")
     cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
     cmd += video_codec_args(encoder)
     cmd += ["-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
@@ -771,6 +1078,16 @@ def render(job, source_path, file_origin, tmp):
         states = caption_states(job["cues"], job["removed"], out_len)
         caption_track = write_caption_track(tmp, states, out_len, job["width"], job["height"])
         log.info("captions cues=%d states=%d", len(job["cues"]), len(states))
+    if job["kind"] == "audio" and job["aspect"] != "audio" and job.get("identity") is not None:
+        try:
+            bg = os.path.join(tmp, "identity.png")
+            layout = draw_identity_background(bg, job["width"], job["height"], job["background"], job["identity"],
+                                              job["caption_position"], bool(caption_track),
+                                              fetch_logo(job["identity"].get("logo_url"), tmp))
+            job = dict(job, identity_bg=bg, wave_box=layout["wave"])
+        except Exception as exc:
+            # The plain background is still a render; the stack is not worth a failure.
+            log.warning("identity skipped type=%s", type(exc).__name__)
     encoder = "none" if job["aspect"] == "audio" else pick_encoder()
     out_path = os.path.join(tmp, "out." + job["container"])
     cmd = build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, encoder)

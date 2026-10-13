@@ -548,3 +548,112 @@ def test_drawn_caption_pill_stays_inside_the_9x16_frame(tmp_path):
     box = alpha.getbbox()
     margin = int(round(1080 * handler.CAPTION_SIDE_MARGIN))
     assert box[0] >= margin - 1 and box[2] <= 1080 - margin + 1, box
+
+
+# ── audiogram identity stack (v0.2.0) ────────────────────────────────────────
+
+IDENTITY = {"logo_url": None, "church_name": "Grace Community Church",
+            "title": "Draw Near: Humility and the Presence of God in an Anxious Week",
+            "speaker": "Pastor Ann Lee", "date": "October 5, 2026"}
+
+
+def _boxes(layout):
+    out = {}
+    for key in ("logo", "name", "title", "meta", "wave"):
+        v = layout[key]
+        if v:
+            out[key] = v if key in ("logo", "wave") else v["box"]
+    return out
+
+
+def _overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+@pytest.mark.parametrize("width,height", [(1080, 1920), (1080, 1080), (1920, 1080)])
+@pytest.mark.parametrize("position", ["bottom", "middle", "top"])
+@pytest.mark.parametrize("logo_size", [(600, 300), (300, 900), None])
+def test_identity_stack_stays_in_the_frame_and_out_of_the_caption_band(width, height, position, logo_size):
+    layout = handler.audiogram_layout(width, height, IDENTITY, position, True, logo_size)
+    boxes = _boxes(layout)
+    assert ("logo" in boxes) == bool(logo_size) and ("name" in boxes) == (not logo_size)
+    assert "title" in boxes and "meta" in boxes and "wave" in boxes
+    band = layout["band"]
+    for key, b in boxes.items():
+        assert 0 <= b[0] < b[2] <= width and 0 <= b[1] < b[3] <= height, (key, b)
+        assert not (b[1] < band[1] and band[0] < b[3]), (key, b, band)       # never in the caption band
+    keys = list(boxes)
+    for i, a in enumerate(keys):
+        for c in keys[i + 1:]:
+            assert not _overlap(boxes[a], boxes[c]), (a, boxes[a], c, boxes[c])
+    if logo_size:  # never stretched
+        x0, y0, x1, y1 = boxes["logo"]
+        assert abs((x1 - x0) / (y1 - y0) - logo_size[0] / logo_size[1]) < 0.02
+    if height > width * 1.2 and position != "top":
+        assert boxes.get("logo", boxes.get("name"))[1] >= int(round(height * 0.12))   # clear of platform overlays
+    meta = layout["meta"]
+    assert len(meta["lines"]) == 1   # speaker · date never wraps
+    assert len(layout["title"]["lines"]) <= 2
+
+
+def test_identity_without_captions_and_without_text_still_lays_out():
+    layout = handler.audiogram_layout(1080, 1920, {"church_name": None, "title": None, "speaker": None, "date": None},
+                                      "bottom", False, None)
+    assert layout["band"] is None and layout["title"] is None and layout["wave"]
+
+
+def test_identity_is_validated_and_only_for_audiograms():
+    audio = {"kind": "audio", "audio_url": "https://supabase.test/a.mp3?token=T", "start": 1.0, "end": 8.0}
+    job = handler.validate_input(_job(source=audio, identity=dict(IDENTITY, logo_url="https://supabase.test/logos/1/logo.png?token=T")))
+    assert job["identity"]["title"] == IDENTITY["title"] and job["identity"]["logo_url"].startswith("https://")
+    assert handler.validate_input(_job(identity=IDENTITY))["identity"] is None       # a YouTube render ignores it
+    with pytest.raises(handler.ClipError):
+        handler.validate_input(_job(source=audio, identity=dict(IDENTITY, title=7)))
+    with pytest.raises(handler.ClipError):
+        handler.validate_input(_job(source=audio, identity=dict(IDENTITY, logo_url="ftp://x/logo.png")))
+
+
+def test_audiogram_command_holds_the_identity_frame_and_overlays_the_waveform():
+    audio = {"kind": "audio", "audio_url": "https://supabase.test/a.mp3?token=T", "start": 1.0, "end": 8.0}
+    job = dict(handler.validate_input(_job(source=audio, identity=IDENTITY)), identity_bg="/tmp/identity.png",
+               wave_box=(64, 900, 1016, 1168))
+    cmd = handler.build_ffmpeg_cmd(job, "/tmp/a.m4a", 0.0, "/tmp/out.mp4", "/tmp/cap.mov", "libx264")
+    i = cmd.index("/tmp/identity.png")
+    assert cmd[i - 7:i + 1] == ["-loop", "1", "-framerate", "30", "-t", "6.000", "-i", "/tmp/identity.png"]  # 7 s less the 1 s cut
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "asplit=2[ap][aw]" in graph and "showwaves=s=952x268:mode=cline" in graph
+    assert "[bg0][wave]overlay=x=64:y=900" in graph and "lavfi" not in cmd
+    # the waveform reads the audio before loudnorm; the mapped audio is still levelled
+    assert graph.index("asplit") < graph.index("loudnorm") and "[ap]loudnorm" in graph
+
+
+@pytest.mark.real
+def test_real_audiogram_render_draws_the_logo_and_the_title(tmp_path, monkeypatch):
+    """A 9:16 audiogram from the sample's audio with a generated logo, then a
+    frame read back: brass pixels where the layout put the logo, light text
+    pixels where it put the title, the house colour elsewhere."""
+    from PIL import Image, ImageDraw
+    monkeypatch.setattr(handler, "pick_encoder", lambda: "libx264")
+    audio = tmp_path / "a.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", SAMPLE, "-vn", "-c:a", "aac", str(audio)], check=True)
+    logo = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+    ImageDraw.Draw(logo).ellipse([0, 0, 399, 399], fill=(184, 132, 46, 255))
+    logo_path = tmp_path / "logo.png"
+    logo.save(logo_path)
+    target = tmp_path / "ag.mp4"
+    job = _job(source={"kind": "audio", "audio_url": "file://" + str(audio), "start": 1.0, "end": 8.0},
+               output={"put_url": "file://" + str(target), "token": None, "container": "mp4"},
+               identity=dict(IDENTITY, logo_url="file://" + str(logo_path)))
+    out = handler.run(job)
+    assert out["ok"] is True, out
+    frame = tmp_path / "f.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2", "-i", str(target), "-frames:v", "1", str(frame)], check=True)
+    img = Image.open(frame).convert("RGB")
+    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "bottom", True, (400, 400))
+    x0, y0, x1, y1 = layout["logo"]
+    r, g, b = img.getpixel(((x0 + x1) // 2, (y0 + y1) // 2))
+    assert r > 150 and 100 < g < 170 and b < 90, (r, g, b)      # brass logo centre
+    tx0, ty0, tx1, ty1 = layout["title"]["box"]
+    strip = img.crop((tx0, ty0, tx1, ty1)).convert("L")
+    assert max(strip.getdata()) > 200                          # the title's light text
+    assert img.getpixel((5, 5))[0] < 40                        # the house colour in the corner

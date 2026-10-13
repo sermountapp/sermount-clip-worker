@@ -38,6 +38,12 @@ Input (`POST /v2/{endpoint_id}/run`, body `{"input": ...}`):
   caption's bottom edge sits at 88 %, 56 % or 24 % of the frame height. Lines wrap to the frame's own
   width less a 6 % margin each side, and the font steps down until the cue fits in two lines.
 - `cache` URLs may be `null` (no cache).
+- `identity` (audio sermons rendered as video, the audiogram): `logo_url` (a short signed GET or `null`),
+  `church_name`, `title`, `speaker`, `date`. The worker draws them on the house background with
+  Pillow (9:16: a centred column from 12 % down; 1:1: logo top-left, text to its right; 16:9: logo
+  top-left, text lower-left), sets the church name where the logo would go when there is none, keeps
+  the stack out of the caption band at every caption position, and lays an ffmpeg `showwaves` line
+  across the largest free span. A logo that cannot be fetched never fails the render.
 
 Output (always; the handler never raises):
 
