@@ -65,7 +65,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.2.2"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.3"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -73,6 +73,18 @@ DOWNLOAD_TIMEOUT = (10, 120)
 DOWNLOAD_CHUNK = 1024 * 1024
 UPLOAD_TIMEOUT = (10, 600)
 ASPECTS = {"16:9", "1:1", "9:16", "audio"}
+
+# Audiogram encode (v0.2.3). An audiogram is a near-still picture (identity
+# background, caption pill, waveform); with no bitrate ceiling nvenc spent
+# ~4.5 Mbit/s on it (render 15: 40.8 MB for 69.5 s). Capped, it is ~7 MB with
+# no visible difference (docs/clip-worker-audiogram-size-brief.md). Video
+# clips keep their own settings until real footage is measured.
+AUDIOGRAM_NVENC_CQ = "30"
+AUDIOGRAM_X264_CRF = "32"
+AUDIOGRAM_MAXRATE = "1.5M"
+AUDIOGRAM_BUFSIZE = "3M"
+AUDIOGRAM_GOP = "60"            # a keyframe every 2 s at 30 fps
+AUDIO_SAMPLE_RATE = "48000"     # loudnorm resamples (it passed 96 kHz through); every output is 48 kHz
 DEFAULT_BACKGROUND = "#0f1115"
 ACCENT = "#B8842E"
 CAPTION_TEXT = "#F6F3EC"
@@ -550,7 +562,14 @@ def pick_encoder():
     return _ENCODER
 
 
-def video_codec_args(encoder):
+def video_codec_args(encoder, audiogram=False):
+    """Video clips: unchanged since v0.2.2. Audiograms (v0.2.3): a lower
+    quality target under a bitrate cap, and 2 s keyframes."""
+    if audiogram:
+        cap = ["-maxrate", AUDIOGRAM_MAXRATE, "-bufsize", AUDIOGRAM_BUFSIZE, "-profile:v", "high", "-g", AUDIOGRAM_GOP]
+        if encoder == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", AUDIOGRAM_NVENC_CQ, "-b:v", "0"] + cap
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", AUDIOGRAM_X264_CRF] + cap
     if encoder == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-profile:v", "high"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"]
@@ -882,7 +901,7 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
 
     if job["aspect"] == "audio":
         cmd += source_in + ["-filter_complex", ";".join(graph), "-map", "[a]", "-vn",
-                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-t", f"{out_len:.3f}", out_path]
+                            "-c:a", "aac", "-b:a", "128k", "-ar", AUDIO_SAMPLE_RATE, "-movflags", "+faststart", "-t", f"{out_len:.3f}", out_path]
         return cmd
 
     width, height = job["width"], job["height"]
@@ -919,8 +938,8 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
     else:
         graph.append(base + "[v]")
     cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
-    cmd += video_codec_args(encoder)
-    cmd += ["-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+    cmd += video_codec_args(encoder, audiogram)
+    cmd += ["-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", AUDIO_SAMPLE_RATE, "-movflags", "+faststart",
             "-t", f"{out_len:.3f}", out_path]
     return cmd
 

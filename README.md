@@ -78,6 +78,10 @@ Output (always; the handler never raises):
    `-c:v copy` with a burn. `h264_nvenc` when the ffmpeg lists it, else `libx264` (chosen at
    runtime by probing `ffmpeg -encoders`, so the worker runs on a laptop without a GPU; a listed
    nvenc that fails to open falls back to libx264 for that job).
+   Encode (v0.2.3): video clips nvenc `-cq 23` (libx264 `-crf 20`), no cap, unchanged since
+   v0.2.2. Audiograms nvenc `-cq 30` (libx264 `-crf 32`) under `-maxrate 1.5M -bufsize 3M`,
+   keyframes every 2 s (`-g 60`); a near-still picture needs no more (render 15 was 40.8 MB for
+   69.5 s uncapped). Every output's audio is AAC at 48 kHz (`-ar 48000`; `loudnorm` resamples).
 3. **Captions** are drawn by Pillow into PNG strips, one per spoken-word state (the current word
    in the accent colour), and placed in the bottom third. The layout rules (bold sans, dark pill,
    two lines split at the space nearest the middle, ~84 characters per cue) are the same ones the
