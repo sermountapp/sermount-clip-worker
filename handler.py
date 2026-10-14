@@ -65,7 +65,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.2.1"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.2"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -106,7 +106,14 @@ FONT_REGULAR_CANDIDATES = (
 IDENTITY_TEXT_MAX = 200
 LOGO_MAX_BYTES = 5 * 1024 * 1024
 WAVE_COLOUR = "0xB8842E@0.85"      # the house accent; 0.55 was nearly invisible on render 11
-WAVE_HEIGHT_FRAC = 0.12            # of the frame height, inside the largest free span
+WAVE_HEIGHT_FRAC = 0.12            # of the frame height (16:9, 1:1)
+WAVE_HEIGHT_FRAC_TALL = 0.14       # 9:16
+# The wave branch only (the audio track is untouched): speech at a pulpit
+# mic's level drew a 2-60 px line in a 230 px box (render 14, v0.2.1), since
+# showwaves draws amplitude. Levelled first (up to +40 dB, a short window),
+# its peaks fill 80-90 % of the box at any source level (measured on a
+# -34 dB speech sample and the test sample at -24 dB).
+WAVE_LEVEL = "dynaudnorm=f=100:g=7:p=0.95:m=100"
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
@@ -610,8 +617,9 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
       9:16  one centred column (logo, title, meta) from 12 % down;
       1:1   logo top-left, title and meta to its right;
       16:9  logo top-left, title and meta as a lower-left block;
-    and the wave across the largest free span that is left. When the
-    captions sit where the stack would go, the stack moves past them."""
+    and the wave (v0.2.2) against the caption band, under it or over it
+    where there is room, else across the largest free span that is left.
+    When the captions sit where the stack would go, the stack moves past them."""
     identity = identity or {}
     W, H = int(width), int(height)
     side = int(round(W * CAPTION_SIDE_MARGIN))
@@ -621,13 +629,27 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
     gap = int(round(H * 0.02))
     band = None
     blocked = []
+    wave_h = int(H * (WAVE_HEIGHT_FRAC_TALL if tall else WAVE_HEIGHT_FRAC))
+    wave_h -= wave_h % 2
+    wave_w = (W - 2 * side) - (W - 2 * side) % 2
+    wave = None
     if captions_on:
         y1 = int(round(H * CAPTION_ANCHORS.get(caption_position, CAPTION_ANCHORS["bottom"])))
         band = (max(0, y1 - caption_strip_height(W, H)), y1)
         blocked.append((band[0] - gap, band[1] + gap))
+        # v0.2.2: the wave hugs the captions, full strip width, a 2 % gap from
+        # the band: directly under it where there is room (Top, Middle), else
+        # directly over it (Bottom). It is placed before the stack, which then
+        # goes round both. v0.2.1 centred it in the largest free span, apart.
+        below, above = band[1] + gap, band[0] - gap - wave_h
+        wy = below if below + wave_h <= H - bottom_safe else (above if above >= top_safe else None)
+        if wy is not None:
+            wy -= wy % 2
+            wave = (side, wy, side + wave_w, wy + wave_h)
+            blocked.append((wy - gap, wy + wave_h + gap))
     meta_text = " · ".join(x for x in (identity.get("speaker"), identity.get("date")) if x)
     title_text = identity.get("title") or ""
-    out = {"band": band, "logo": None, "name": None, "title": None, "meta": None, "wave": None}
+    out = {"band": band, "logo": None, "name": None, "title": None, "meta": None, "wave": wave}
 
     def logo_box(max_w, max_h):
         if not logo_size:
@@ -734,7 +756,9 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
                             "align": "left", "regular": key == "meta"}
                 y += h + inner
 
-    # The wave: across the largest free span left between everything else.
+    if out["wave"]:
+        return out
+    # No captions (or no room by them): the wave across the largest free span left.
     taken = list(blocked)
     for key in ("logo", "name", "title", "meta"):
         v = out[key]
@@ -744,12 +768,11 @@ def audiogram_layout(width, height, identity, caption_position, captions_on, log
     spans = sorted(_free(top_safe, H - bottom_safe, taken), key=lambda s: s[1] - s[0], reverse=True)
     if spans and spans[0][1] - spans[0][0] >= int(H * 0.05):
         s0, s1 = spans[0]
-        wh = min(int(H * WAVE_HEIGHT_FRAC), s1 - s0)
+        wh = min(wave_h, s1 - s0)
         wh -= wh % 2
         wy = s0 + (s1 - s0 - wh) // 2
         wy -= wy % 2
-        ww = (W - 2 * side) - (W - 2 * side) % 2
-        out["wave"] = (side, wy, side + ww, wy + wh)
+        out["wave"] = (side, wy, side + wave_w, wy + wh)
     return out
 
 
@@ -851,7 +874,7 @@ def build_ffmpeg_cmd(job, source_path, file_origin, out_path, caption_track, enc
         # The waveform reads the cut audio before loudnorm (which resamples).
         graph = [f"[{audio_src}]" + ",".join(cut_chain + ["asplit=2"]) + "[ap][aw]",
                  "[ap]" + ",".join(level_chain or ["anull"]) + "[a]",
-                 f"[aw]showwaves=s={wave[2] - wave[0]}x{wave[3] - wave[1]}:mode=cline:scale=sqrt:rate=30:colors={WAVE_COLOUR},format=rgba[wave]"]
+                 f"[aw]{WAVE_LEVEL},showwaves=s={wave[2] - wave[0]}x{wave[3] - wave[1]}:mode=cline:scale=sqrt:rate=30:colors={WAVE_COLOUR},format=rgba[wave]"]
     else:
         graph = [f"[{audio_src}]" + ",".join(cut_chain + level_chain or ["anull"]) + "[a]"]
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-nostdin"]

@@ -682,15 +682,81 @@ def test_caption_fractions_match_the_app():
         assert 'CAPTION_FONT_FRAC = {"9:16": 0.034, "1:1": 0.046, "16:9": 0.046}' in open(app_captions).read()
 
 
-def test_waveform_is_twelve_percent_high_and_strong_enough_to_see():
-    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "bottom", True, (600, 300))
-    x0, y0, x1, y1 = layout["wave"]
-    assert y1 - y0 == int(1920 * 0.12) - int(1920 * 0.12) % 2
+def test_waveform_box_is_fourteen_percent_at_9x16_and_twelve_otherwise():
+    for (w, h), frac in (((1080, 1920), 0.14), ((1080, 1080), 0.12), ((1920, 1080), 0.12)):
+        for position in ("bottom", "middle", "top"):
+            x0, y0, x1, y1 = handler.audiogram_layout(w, h, IDENTITY, position, True, (600, 300))["wave"]
+            assert y1 - y0 == int(h * frac) - int(h * frac) % 2, (w, h, position)
+            side = int(round(w * handler.CAPTION_SIDE_MARGIN))
+            assert x0 == side and x1 - x0 == (w - 2 * side) - (w - 2 * side) % 2      # the full strip width
     assert handler.WAVE_COLOUR == "0xB8842E@0.85"
+
+
+@pytest.mark.parametrize("width,height", [(1080, 1920), (1080, 1080), (1920, 1080)])
+@pytest.mark.parametrize("position", ["bottom", "middle", "top"])
+def test_waveform_hugs_the_caption_band(width, height, position):
+    """v0.2.2 (render 14): the wave sits against the captions with a 2 % gap,
+    under the band where there is room, else over it; v0.2.1 centred it in
+    the largest free span, apart from everything."""
+    layout = handler.audiogram_layout(width, height, IDENTITY, position, True, None)
+    band, (x0, y0, x1, y1) = layout["band"], layout["wave"]
+    gap = int(round(height * 0.02))
+    under, over = y0 - band[1], band[0] - y1
+    assert (0 <= under <= gap) or (0 <= over <= gap + 1), (band, layout["wave"])
+    if height > width * 1.2:
+        assert (under >= 0) == (position in ("middle", "top"))                   # Bottom has no room under it at 9:16
+    for key in ("name", "title", "meta"):
+        b = layout[key]["box"]
+        assert not (b[1] < y1 and y0 < b[3]), (key, b, layout["wave"])          # the stack goes round it
+
+
+def test_waveform_without_captions_takes_the_largest_free_span():
+    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "bottom", False, None)
+    assert layout["band"] is None and layout["wave"][3] - layout["wave"][1] == int(1920 * 0.14) - int(1920 * 0.14) % 2
+
+
+def test_waveform_branch_is_levelled_and_the_audio_track_is_not():
+    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "middle", True, None)
     audio = {"kind": "audio", "audio_url": "https://supabase.test/a.mp3?token=T", "start": 1.0, "end": 8.0}
     job = dict(handler.validate_input(_job(source=audio, identity=IDENTITY)), identity_bg="/tmp/i.png", wave_box=layout["wave"])
     graph = handler.build_ffmpeg_cmd(job, "/tmp/a.m4a", 0.0, "/tmp/o.mp4", None, "libx264")
-    assert "mode=cline:scale=sqrt" in graph[graph.index("-filter_complex") + 1]
+    graph = graph[graph.index("-filter_complex") + 1]
+    assert f"[aw]{handler.WAVE_LEVEL},showwaves=" in graph and "mode=cline:scale=sqrt" in graph
+    assert handler.WAVE_LEVEL.startswith("dynaudnorm=")
+    ap = graph[graph.index("[ap]"):graph.index("[a]")]
+    assert "dynaudnorm" not in ap                                                  # the heard audio is untouched
+
+
+@pytest.mark.real
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg needed")
+def test_real_quiet_audiogram_draws_a_wave_that_fills_its_box(tmp_path, monkeypatch):
+    """Render 14: a pulpit-level source drew a ~3 % line in a 12 % box. The
+    sample's audio at -24 dB, rendered for real at 9:16 Middle, must draw at
+    least 75 % of the wave box's height (peaks; quiet syllables draw less)."""
+    from PIL import Image
+    monkeypatch.setattr(handler, "pick_encoder", lambda: "libx264")
+    quiet = str(tmp_path / "quiet.m4a")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", SAMPLE, "-vn", "-af", "volume=-24dB", "-c:a", "aac", quiet], check=True)
+    target = str(tmp_path / "ag.mp4")
+    words = "Draw near to God and he will draw near to you".split()
+    cue = {"s": 0.2, "e": 7.0, "words": [{"w": w, "s": 0.2 + i * 0.6, "e": 0.7 + i * 0.6} for i, w in enumerate(words)]}
+    out = handler.run(_job(source={"kind": "audio", "audio_url": "file://" + quiet, "start": 0.5, "end": 8.5},
+                           output={"put_url": "file://" + target, "token": None, "container": "mp4"},
+                           captions={"cues": [cue], "position": "middle"}, identity=IDENTITY))
+    assert out["ok"] is True, out
+    layout = handler.audiogram_layout(1080, 1920, IDENTITY, "middle", True, None)
+    x0, y0, x1, y1 = layout["wave"]
+    lo = hi = None
+    for t in (1.5, 3.0, 4.5, 6.0):
+        png = str(tmp_path / f"f{t}.png")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", target, "-frames:v", "1", png], check=True)
+        px = Image.open(png).convert("RGB").load()
+        for y in range(y0, y1):
+            if any(abs(px[x, y][0] - 0xB8) < 40 and abs(px[x, y][1] - 0x84) < 40 and abs(px[x, y][2] - 0x2E) < 40
+                   for x in range(x0, x1, 4)):
+                lo = y if lo is None else min(lo, y)
+                hi = y if hi is None else max(hi, y)
+    assert lo is not None and (hi - lo + 1) >= 0.75 * (y1 - y0), (lo, hi, y0, y1)
 
 
 
