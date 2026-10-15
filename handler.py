@@ -65,7 +65,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 
-IMAGE_TAG = "v0.2.3"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.4"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -74,16 +74,23 @@ DOWNLOAD_CHUNK = 1024 * 1024
 UPLOAD_TIMEOUT = (10, 600)
 ASPECTS = {"16:9", "1:1", "9:16", "audio"}
 
-# Audiogram encode (v0.2.3). An audiogram is a near-still picture (identity
-# background, caption pill, waveform); with no bitrate ceiling nvenc spent
-# ~4.5 Mbit/s on it (render 15: 40.8 MB for 69.5 s). Capped, it is ~7 MB with
-# no visible difference (docs/clip-worker-audiogram-size-brief.md). Video
-# clips keep their own settings until real footage is measured.
+# Encode (v0.2.4). Every output has a bitrate ceiling and a keyframe every
+# 2 s. An audiogram is a near-still picture (identity background, caption
+# pill, waveform): uncapped, nvenc spent ~4.5 Mbit/s on it (render 15: 40.8 MB
+# for 69.5 s); at cq 30 it still ran AT v0.2.3's 1.5M ceiling (14.65 MB for
+# 70.5 s), so the ceiling is what sets its size: 0.8M is ~8.5 MB per 70 s.
+# A video clip at cq 23 with no ceiling ran ~6.6 Mbit/s (render 13: 64.3 MB
+# for 75.5 s); the user chose the CRF 26 tier, under a 4M guard for heavy
+# motion. docs/clip-worker-v0-2-4-encode-brief.md.
 AUDIOGRAM_NVENC_CQ = "30"
 AUDIOGRAM_X264_CRF = "32"
-AUDIOGRAM_MAXRATE = "1.5M"
-AUDIOGRAM_BUFSIZE = "3M"
-AUDIOGRAM_GOP = "60"            # a keyframe every 2 s at 30 fps
+AUDIOGRAM_MAXRATE = "0.8M"
+AUDIOGRAM_BUFSIZE = "1.6M"
+VIDEO_NVENC_CQ = "26"
+VIDEO_X264_CRF = "26"
+VIDEO_MAXRATE = "4M"
+VIDEO_BUFSIZE = "8M"
+GOP_FRAMES = "60"               # a keyframe every 2 s at 30 fps
 AUDIO_SAMPLE_RATE = "48000"     # loudnorm resamples (it passed 96 kHz through); every output is 48 kHz
 DEFAULT_BACKGROUND = "#0f1115"
 ACCENT = "#B8842E"
@@ -563,16 +570,16 @@ def pick_encoder():
 
 
 def video_codec_args(encoder, audiogram=False):
-    """Video clips: unchanged since v0.2.2. Audiograms (v0.2.3): a lower
-    quality target under a bitrate cap, and 2 s keyframes."""
+    """A quality target under a bitrate ceiling, 2 s keyframes: the
+    audiogram's (v0.2.3, ceiling v0.2.4) or the video clip's (v0.2.4)."""
     if audiogram:
-        cap = ["-maxrate", AUDIOGRAM_MAXRATE, "-bufsize", AUDIOGRAM_BUFSIZE, "-profile:v", "high", "-g", AUDIOGRAM_GOP]
-        if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", AUDIOGRAM_NVENC_CQ, "-b:v", "0"] + cap
-        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", AUDIOGRAM_X264_CRF] + cap
+        cq, crf, maxrate, bufsize = AUDIOGRAM_NVENC_CQ, AUDIOGRAM_X264_CRF, AUDIOGRAM_MAXRATE, AUDIOGRAM_BUFSIZE
+    else:
+        cq, crf, maxrate, bufsize = VIDEO_NVENC_CQ, VIDEO_X264_CRF, VIDEO_MAXRATE, VIDEO_BUFSIZE
+    cap = ["-maxrate", maxrate, "-bufsize", bufsize, "-profile:v", "high", "-g", GOP_FRAMES]
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-profile:v", "high"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"]
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", cq, "-b:v", "0"] + cap
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf] + cap
 
 
 # ── audiogram identity stack ─────────────────────────────────────────────────

@@ -783,11 +783,17 @@ def test_the_fetch_window_from_the_app_is_the_cached_files_origin(quiet, monkeyp
                                                 "start": 189.75, "end": 194.25, **bad}))
 
 
-# ── v0.2.3: audiogram size, 48 kHz audio, 2 s keyframes ──────────────────────
+# ── v0.2.4: every output capped, 2 s keyframes, 48 kHz audio ─────────────────
 
-V022_VIDEO_ARGS = {
-    "h264_nvenc": ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-profile:v", "high"],
-    "libx264": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"],
+V024_ARGS = {
+    ("h264_nvenc", True): ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "30", "-b:v", "0",
+                           "-maxrate", "0.8M", "-bufsize", "1.6M", "-profile:v", "high", "-g", "60"],
+    ("libx264", True): ["-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
+                        "-maxrate", "0.8M", "-bufsize", "1.6M", "-profile:v", "high", "-g", "60"],
+    ("h264_nvenc", False): ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "26", "-b:v", "0",
+                            "-maxrate", "4M", "-bufsize", "8M", "-profile:v", "high", "-g", "60"],
+    ("libx264", False): ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                         "-maxrate", "4M", "-bufsize", "8M", "-profile:v", "high", "-g", "60"],
 }
 
 
@@ -796,29 +802,33 @@ def _codec_slice(cmd):
     return cmd[i:cmd.index("-pix_fmt")]
 
 
-@pytest.mark.parametrize("encoder,quality", [("h264_nvenc", ["-cq", "30", "-b:v", "0"]), ("libx264", ["-crf", "32"])])
-def test_an_audiogram_is_capped_with_two_second_keyframes_and_48k_audio(encoder, quality):
-    job = handler.validate_input(_job(source={"kind": "audio", "audio_url": "https://supabase.test/a.mp3", "start": 100.0, "end": 108.0}))
-    cmd = handler.build_ffmpeg_cmd(job, "/t/source.audio", 0.0, "/t/out.mp4", None, encoder)
-    args = _codec_slice(cmd)
-    assert args[:2] == ["-c:v", encoder]
-    i = args.index(quality[0])
-    assert args[i:i + len(quality)] == quality
-    assert args[args.index("-maxrate") + 1] == "1.5M" and args[args.index("-bufsize") + 1] == "3M"
-    assert args[args.index("-g") + 1] == "60" and args[args.index("-profile:v") + 1] == "high"
-    assert cmd[cmd.index("-ar") + 1] == "48000" and cmd[cmd.index("-b:a") + 1] == "160k"
-    assert (handler.AUDIOGRAM_NVENC_CQ, handler.AUDIOGRAM_X264_CRF, handler.AUDIOGRAM_MAXRATE,
-            handler.AUDIOGRAM_BUFSIZE, handler.AUDIOGRAM_GOP) == ("30", "32", "1.5M", "3M", "60")
+def _audio_job(**over):
+    return _job(source={"kind": "audio", "audio_url": "https://supabase.test/a.mp3", "start": 100.0, "end": 108.0}, **over)
 
 
 @pytest.mark.parametrize("encoder", ["h264_nvenc", "libx264"])
-def test_a_video_clip_keeps_its_v022_codec_arguments_exactly(encoder):
+def test_an_audiogram_has_the_v024_arguments_exactly(encoder):
+    job = handler.validate_input(_audio_job())
+    cmd = handler.build_ffmpeg_cmd(job, "/t/source.audio", 0.0, "/t/out.mp4", None, encoder)
+    assert _codec_slice(cmd) == V024_ARGS[(encoder, True)]
+    assert handler.video_codec_args(encoder, True) == V024_ARGS[(encoder, True)]
+    assert cmd[cmd.index("-ar") + 1] == "48000" and cmd[cmd.index("-b:a") + 1] == "160k"
+
+
+@pytest.mark.parametrize("encoder", ["h264_nvenc", "libx264"])
+def test_a_video_clip_has_the_v024_arguments_exactly(encoder):
     job = handler.validate_input(_job())
     cmd = handler.build_ffmpeg_cmd(job, "/t/source.mp4", 90.0, "/t/out.mp4", "/t/cap/captions.mov", encoder)
-    assert _codec_slice(cmd) == V022_VIDEO_ARGS[encoder]
-    assert handler.video_codec_args(encoder) == V022_VIDEO_ARGS[encoder]
-    assert "-maxrate" not in cmd and "-g" not in cmd
+    assert _codec_slice(cmd) == V024_ARGS[(encoder, False)]
+    assert handler.video_codec_args(encoder) == V024_ARGS[(encoder, False)]
     assert cmd[cmd.index("-ar") + 1] == "48000" and cmd[cmd.index("-b:a") + 1] == "160k"
+
+
+def test_the_encode_constants_are_named():
+    assert (handler.AUDIOGRAM_NVENC_CQ, handler.AUDIOGRAM_X264_CRF, handler.AUDIOGRAM_MAXRATE, handler.AUDIOGRAM_BUFSIZE) == ("30", "32", "0.8M", "1.6M")
+    assert (handler.VIDEO_NVENC_CQ, handler.VIDEO_X264_CRF, handler.VIDEO_MAXRATE, handler.VIDEO_BUFSIZE) == ("26", "26", "4M", "8M")
+    assert handler.GOP_FRAMES == "60" and handler.AUDIO_SAMPLE_RATE == "48000"
+    assert handler.IMAGE_TAG == "v0.2.4"
 
 
 def test_the_audio_only_output_is_48k_with_no_video_arguments():
@@ -826,37 +836,54 @@ def test_the_audio_only_output_is_48k_with_no_video_arguments():
     cmd = handler.build_ffmpeg_cmd(job, "/t/source.mp4", 90.0, "/t/out.m4a", None, "none")
     assert cmd[cmd.index("-ar") + 1] == "48000" and cmd[cmd.index("-b:a") + 1] == "128k"
     assert "-c:v" not in cmd and "-maxrate" not in cmd and "-g" not in cmd
-    assert handler.IMAGE_TAG == "v0.2.3"
+
+
+def _probe(path, *args):
+    out = subprocess.run(["ffprobe", "-v", "error", *args, "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
+    return [t.strip(",") for t in out.split()]
+
+
+def _keyframes(path):
+    return [float(t) for t in _probe(path, "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=pts_time")]
+
+
+def _render_both_ways(tmp_path, monkeypatch, make_job):
+    """The same job with the args before v0.2.3 (cq 23 / crf 20, no cap,
+    default GOP) and with v0.2.4's."""
+    monkeypatch.setattr(handler, "pick_encoder", lambda: "libx264")
+    new = tmp_path / "new.mp4"
+    assert handler.run(make_job(new))["ok"] is True
+    v024 = handler.video_codec_args
+    monkeypatch.setattr(handler, "video_codec_args", lambda encoder, audiogram=False: ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-profile:v", "high"])
+    old = tmp_path / "old.mp4"
+    assert handler.run(make_job(old))["ok"] is True
+    monkeypatch.setattr(handler, "video_codec_args", v024)
+    return new, old
 
 
 @pytest.mark.real
 def test_real_audiogram_is_smaller_48k_and_keyframes_every_two_seconds(tmp_path, monkeypatch):
-    """The same 9:16 audiogram rendered with v0.2.2's video arguments and
-    with v0.2.3's: smaller, 48 kHz, a keyframe every 2 s."""
-    monkeypatch.setattr(handler, "pick_encoder", lambda: "libx264")
     audio = tmp_path / "a.m4a"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", SAMPLE, "-vn", "-c:a", "aac", "-ar", "96000", str(audio)], check=True)
+    new, old = _render_both_ways(tmp_path, monkeypatch, lambda target: _job(
+        source={"kind": "audio", "audio_url": "file://" + str(audio), "start": 0.5, "end": 9.5},
+        output={"put_url": "file://" + str(target), "token": None, "container": "mp4"}, identity=IDENTITY, edits={"removed": []}))
+    assert _probe(new, "-select_streams", "a:0", "-show_entries", "stream=sample_rate") == ["48000"]
+    keys = _keyframes(new)
+    assert keys[0] == 0.0 and {round(b - a, 2) for a, b in zip(keys, keys[1:])} == {2.0}, keys
+    print(f"audiogram 9 s: before {old.stat().st_size} bytes, v0.2.4 {new.stat().st_size} bytes, keyframes {keys}")
+    assert new.stat().st_size < old.stat().st_size
 
-    def render(name):
-        target = tmp_path / name
-        job = _job(source={"kind": "audio", "audio_url": "file://" + str(audio), "start": 0.5, "end": 9.5},
-                   output={"put_url": "file://" + str(target), "token": None, "container": "mp4"}, identity=IDENTITY, edits={"removed": []})
-        out = handler.run(job)
-        assert out["ok"] is True, out
-        return target
 
-    new = render("new.mp4")
-    old_args = handler.video_codec_args
-    monkeypatch.setattr(handler, "video_codec_args", lambda encoder, audiogram=False: old_args(encoder))
-    old = render("old.mp4")
-
-    def probe(path, *args):
-        return subprocess.run(["ffprobe", "-v", "error", *args, "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout.split()
-
-    assert probe(new, "-select_streams", "a:0", "-show_entries", "stream=sample_rate") == ["48000"]
-    keys = [float(t.strip(",")) for t in probe(new, "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=pts_time")]
-    gaps = {round(b - a, 2) for a, b in zip(keys, keys[1:])}
-    assert keys[0] == 0.0 and gaps == {2.0}, keys
-    new_size, old_size = new.stat().st_size, old.stat().st_size
-    print(f"audiogram 9 s: v0.2.2 args {old_size} bytes, v0.2.3 {new_size} bytes, keyframes {keys}")
-    assert new_size < old_size
+@pytest.mark.real
+def test_real_video_clip_is_smaller_48k_and_keyframes_at_most_two_seconds_apart(tmp_path, monkeypatch):
+    new, old = _render_both_ways(tmp_path, monkeypatch, lambda target: _job(
+        source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "start": 0.5, "end": 9.5},
+        cache={"get_url": "file://" + SAMPLE, "put_url": None, "token": None},
+        output={"put_url": "file://" + str(target), "token": None, "container": "mp4"}, edits={"removed": []}))
+    assert _probe(new, "-select_streams", "a:0", "-show_entries", "stream=sample_rate") == ["48000"]
+    keys = _keyframes(new)
+    # -g is the longest gap; the encoder may add a keyframe at a scene cut (the sample has some)
+    assert keys[0] == 0.0 and max(b - a for a, b in zip(keys, keys[1:])) <= 2.01, keys
+    print(f"video 9 s: before {old.stat().st_size} bytes, v0.2.4 {new.stat().st_size} bytes, keyframes {keys}")
+    assert new.stat().st_size < old.stat().st_size
