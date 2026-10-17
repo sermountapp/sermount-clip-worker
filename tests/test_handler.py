@@ -1049,3 +1049,185 @@ def test_audio_job_does_not_need_the_proxy(quiet, monkeypatch, state):
     monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
     out = handler.run(_audio_job())
     assert out["ok"] is True and out["cause"] is None
+
+
+# ── v0.2.5: causes ───────────────────────────────────────────────────────────
+
+P = "[proxy]"
+CAUSE_TABLE = [
+    ("proxy_auth", f"ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', OSError('Tunnel connection failed: 407 Proxy Authentication Required'))"),
+    ("proxy_auth", "ERROR: 407 Proxy Authentication Required"),
+    ("proxy_unreachable", f"ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='{P}', port=10001): Failed to establish a new connection: [Errno 111] Connection refused\"))"),
+    ("proxy_unreachable", "ERROR: Tunnel connection failed: 502 Bad Gateway"),
+    ("proxy_unreachable", f"ERROR: Read timed out talking to {P}:10001 (ProxyError)"),
+    ("proxy_unreachable", f"ERROR: connection reset by peer via proxy {P}"),
+    ("blocked", "ERROR: [youtube] x: Sign in to confirm you're not a bot. Use --cookies-from-browser"),
+    ("blocked", "ERROR: unable to download video data: HTTP Error 403: Forbidden"),
+    ("blocked", "ERROR: [youtube] x: HTTP Error 429: Too Many Requests"),
+    ("unavailable", "ERROR: [youtube] x: Private video. Sign in if you've been granted access to this video"),
+    ("unavailable", "ERROR: [youtube] x: Video unavailable. This video has been removed by the uploader"),
+    ("unavailable", "ERROR: [youtube] x: The uploader has not made this video available in your country; Video unavailable"),
+    ("unavailable", "ERROR: [youtube] x: Sign in to confirm your age. This video may be inappropriate for some users."),
+    ("unavailable", "ERROR: [youtube] x: This live event will begin in 3 hours."),
+    ("unavailable", "ERROR: [youtube] x: Premieres in 2 days"),
+    ("no_format", "ERROR: [youtube] x: Requested format is not available. Use --list-formats for a list of available formats"),
+    ("no_format", "ERROR: [youtube] x: No video formats found!"),
+    ("no_format", "WARNING: [youtube] x: Signature solving failed: Some formats may be missing."),
+    ("no_format", "WARNING: [youtube] x: n challenge solving failed: Some formats may be missing."),
+    ("fetch_timeout", "ERROR: unable to download video data: The read operation timed out"),
+    ("fetch_timeout", "ERROR: Read timed out. (read timeout=20)"),
+    ("fetch_other", "ERROR: ffmpeg exited with code 1"),
+    ("fetch_other", ""),
+]
+
+
+@pytest.mark.parametrize("cause,message", CAUSE_TABLE, ids=[f"{c}-{i}" for i, (c, _) in enumerate(CAUSE_TABLE)])
+def test_fetch_cause_classification(cause, message):
+    assert handler.classify_fetch(message) == cause
+
+
+def _raising_youtubedl(message, calls):
+    class FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            import yt_dlp
+            calls.append(dict(self.opts))
+            raise yt_dlp.utils.DownloadError(message.format(proxy=self.opts.get("proxy")))
+    return FakeYDL
+
+
+def test_a_407_quoting_the_proxy_is_redacted_then_classified(quiet, monkeypatch):
+    """The message quotes the full proxy URL (password included): the cause
+    is read from the redacted text, and the detail the app gets never holds
+    the password, the user or the host."""
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    msg = ("ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', "
+           "OSError('Tunnel connection failed: 407 Proxy Authentication Required')) proxy={proxy} " + "z" * 400)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _raising_youtubedl(msg, []))
+    out = handler.run(_job())
+    assert out["ok"] is False and out["reason"] == "fetch" and out["cause"] == "proxy_auth"
+    d = out["cause_detail"]
+    assert "proxy=[proxy]" in d and len(d) <= 300 and "\n" not in d
+    for part in ("s3cr3t", "user-sp1", "gate.example.test"):
+        assert part not in d and part not in json.dumps(out)
+
+
+def test_real_youtubedl_messages_classify_against_a_local_proxy(monkeypatch):
+    """Real yt-dlp, real requests, a local proxy (no internet): a 407 at the
+    CONNECT reads proxy_auth and a closed port proxy_unreachable, so the
+    wording the classifier keys on is yt-dlp 2026.08.19's own."""
+    import socket
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    srv, port = _local_proxy(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=x\r\n"
+                             b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); dead = s.getsockname()[1]; s.close()
+    try:
+        for p, want in ((port, "proxy_auth"), (dead, "proxy_unreachable")):
+            url = f"http://user-sp1:s3cr3t@127.0.0.1:{p}"
+            monkeypatch.setattr(handler, "PROXY_URL", url)
+            with pytest.raises(handler.ClipError) as err:
+                handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "/nonexistent/x.mp4", 90, 118)
+            assert err.value.reason == "fetch" and err.value.cause == want, err.value.detail
+            assert "s3cr3t" not in err.value.detail and "user-sp1" not in err.value.detail
+    finally:
+        srv.close()
+
+
+def test_a_success_carries_null_cause_and_the_boot_values(quiet, monkeypatch):
+    monkeypatch.setattr(handler, "download", lambda url, dest, timeout=None: (shutil.copyfile(SAMPLE, dest), 1)[1])
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+    monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}))
+    assert out["ok"] is True
+    assert (out["cause"], out["cause_detail"], out["proxy_probe"], out["proxy_fp"]) == (None, None, "ok", handler.proxy_fingerprint(SECRET_PROXY))
+
+
+class _HttpResp:
+    def __init__(self, status, chunks=()):
+        self.status_code, self.chunks = status, chunks
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def iter_content(self, n): return iter(self.chunks)
+
+
+@pytest.mark.parametrize("behaviour,cause,detail", [
+    (lambda: _HttpResp(403), "source_http", "HTTP 403"),
+    (lambda: _HttpResp(200, []), "source_empty", None),
+    (lambda: (_ for _ in ()).throw(__import__("requests").ConnectionError("https://supabase.test/a.mp3?token=SECRETTOKEN")), "source_network", "ConnectionError"),
+])
+def test_audio_fetch_causes(quiet, monkeypatch, behaviour, cause, detail):
+    monkeypatch.setattr(handler.requests, "get", lambda *a, **k: behaviour())
+    out = handler.run(_audio_job())
+    assert (out["reason"], out["cause"], out["cause_detail"]) == ("fetch", cause, detail)
+    assert "SECRETTOKEN" not in json.dumps(out)
+
+
+def test_audio_fetch_too_big(quiet, monkeypatch):
+    monkeypatch.setattr(handler, "MAX_SOURCE_BYTES", 10)
+    monkeypatch.setattr(handler.requests, "get", lambda *a, **k: _HttpResp(200, [b"x" * 8, b"x" * 8]))
+    out = handler.run(_audio_job())
+    assert (out["reason"], out["cause"]) == ("fetch", "source_too_big")
+
+
+def _cached(monkeypatch):
+    monkeypatch.setattr(handler, "download", lambda url, dest, timeout=None: (shutil.copyfile(SAMPLE, dest), 1)[1])
+
+
+def test_render_causes(quiet, monkeypatch):
+    _cached(monkeypatch)
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+    job = _job(cache={"get_url": "https://supabase.test/c.mp4"}, captions=None)
+    monkeypatch.setattr(handler.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "first\nConversion failed!\n"))
+    out = handler.run(job)
+    assert (out["reason"], out["cause"], out["cause_detail"]) == ("render", "encode", "Conversion failed!")
+    monkeypatch.setattr(handler.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""))
+    out = handler.run(job)
+    assert (out["reason"], out["cause"]) == ("render", "encode_empty")
+    def slow(cmd, **kw): raise subprocess.TimeoutExpired(cmd, 1)
+    monkeypatch.setattr(handler.subprocess, "run", slow)
+    out = handler.run(job)
+    assert (out["reason"], out["cause"]) == ("timeout", "encode_timeout")
+
+
+def test_caption_track_cause(quiet, monkeypatch):
+    _cached(monkeypatch)
+    monkeypatch.setattr(handler.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "bad concat\n"))
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}))
+    assert (out["reason"], out["cause"], out["cause_detail"]) == ("render", "caption_track", "bad concat")
+
+
+@pytest.mark.parametrize("put,cause,detail", [
+    (lambda *a, **k: type("R", (), {"status_code": 413})(), "upload_http", "HTTP 413"),
+    (lambda *a, **k: (_ for _ in ()).throw(__import__("requests").Timeout("https://supabase.test/x?token=SECRETTOKEN")), "upload_network", "Timeout"),
+])
+def test_upload_causes(quiet, monkeypatch, put, cause, detail):
+    _cached(monkeypatch)
+    monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
+    monkeypatch.setattr(handler.requests, "put", put)
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}))
+    assert (out["reason"], out["cause"], out["cause_detail"]) == ("upload", cause, detail)
+    assert "SECRETTOKEN" not in json.dumps(out)
+
+
+def test_input_too_long_and_error_causes(quiet, monkeypatch):
+    assert handler.run({"source": {"kind": "youtube"}})["cause"] == "input"
+    _cached(monkeypatch)
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}, edits={"removed": [[0.0, 7.8]]}))
+    assert (out["reason"], out["cause"]) == ("input", "too_short")
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}, max_output_seconds=5))
+    assert (out["reason"], out["cause"]) == ("too_long", None)
+    monkeypatch.setattr(handler, "download", lambda *a, **k: 1 / 0)
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}))
+    assert (out["reason"], out["cause"], out["cause_detail"]) == ("error", "ZeroDivisionError", None)
+
+
+def test_reason_keeps_its_eight_words():
+    """The app maps exactly these (app/clips.py _WORKER_REASONS); a cause
+    never leaks into reason."""
+    src = open(os.path.join(ROOT, "handler.py")).read()
+    reasons = set(__import__("re").findall(r'ClipError\(\s*"(\w+)"', src)) | {"error"}
+    assert reasons <= {"input", "fetch", "cache", "render", "upload", "too_long", "timeout", "error"}, reasons

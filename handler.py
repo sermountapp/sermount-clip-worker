@@ -567,11 +567,11 @@ def write_caption_track(tmp, states, out_len, width, height):
            "-vf", "fps=30,format=argb", "-c:v", "qtrle", "-t", f"{out_len:.3f}", track]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(600, out_len * 10))
-    except (subprocess.TimeoutExpired, OSError):
-        raise ClipError("render")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise ClipError("render", cause="caption_track", detail=type(exc).__name__)
     if proc.returncode != 0 or not os.path.exists(track):
         log.info("caption track failed rc=%s", proc.returncode)
-        raise ClipError("render")
+        raise ClipError("render", cause="caption_track", detail=_stderr_tail(proc.stderr))
     return track
 
 
@@ -986,24 +986,28 @@ def download(url, dest, timeout=DOWNLOAD_TIMEOUT):
     if p.scheme == "file":
         try:
             shutil.copyfile(p.path, dest)
-            return os.path.getsize(dest)
-        except OSError:
-            raise ClipError("fetch")
+            size = os.path.getsize(dest)
+        except OSError as exc:
+            raise ClipError("fetch", cause="source_network", detail=type(exc).__name__)
+        if size == 0:
+            raise ClipError("fetch", cause="source_empty")
+        return size
     total = 0
     try:
         with requests.get(url, stream=True, timeout=timeout) as resp:
             if resp.status_code != 200:
-                raise ClipError("fetch")
+                raise ClipError("fetch", cause="source_http", detail=f"HTTP {resp.status_code}")
             with open(dest, "wb") as fh:
                 for chunk in resp.iter_content(DOWNLOAD_CHUNK):
                     total += len(chunk)
                     if total > MAX_SOURCE_BYTES:
-                        raise ClipError("fetch")
+                        raise ClipError("fetch", cause="source_too_big")
                     fh.write(chunk)
-    except requests.RequestException:
-        raise ClipError("fetch")
+    except requests.RequestException as exc:
+        # the class only: the message quotes the signed URL
+        raise ClipError("fetch", cause="source_network", detail=type(exc).__name__)
     if total == 0:
-        raise ClipError("fetch")
+        raise ClipError("fetch", cause="source_empty")
     return total
 
 
@@ -1014,16 +1018,16 @@ def upload(url, token, path, content_type, reason):
         try:
             shutil.copyfile(path, p.path)
             return
-        except OSError:
-            raise ClipError(reason)
+        except OSError as exc:
+            raise ClipError(reason, cause="upload_network", detail=type(exc).__name__)
     try:
         with open(path, "rb") as fh:
             resp = requests.put(_with_token(url, token), data=fh, timeout=UPLOAD_TIMEOUT,
                                 headers={"Content-Type": content_type, "x-upsert": "true"})
-    except requests.RequestException:
-        raise ClipError(reason)
+    except requests.RequestException as exc:
+        raise ClipError(reason, cause="upload_network", detail=type(exc).__name__)
     if resp.status_code >= 300:
-        raise ClipError(reason)
+        raise ClipError(reason, cause="upload_http", detail=f"HTTP {resp.status_code}")
 
 
 # ── fetch ────────────────────────────────────────────────────────────────────
@@ -1054,6 +1058,40 @@ def redact(msg, secrets):
     for secret in secrets:
         text = text.replace(secret, "[proxy]")
     return text[:YTDLP_MESSAGE_CAP]
+
+
+def _stderr_tail(stderr):
+    """ffmpeg's last stderr line (it runs at -loglevel error; the inputs are
+    local temp files, captions are pictures), one line, capped; or None."""
+    lines = [ln for ln in (stderr or "").splitlines() if ln.strip()]
+    return redact(lines[-1], ()) if lines else None
+
+
+# Fetch causes (v0.2.5), first match wins, on the REDACTED message: the most
+# specific first, so a wording change downgrades to fetch_other, never to a
+# wrong word. "Names the proxy" means the message says proxy (a quoted URL
+# reads [proxy] by then).
+_AGE = r"confirm your age|age[- ]restricted"
+FETCH_CAUSES = (
+    ("proxy_auth", r"\b407\b"),
+    ("proxy_unreachable", r"unable to connect to proxy|tunnel connection failed|proxyerror"
+                          r"|(?=.*proxy).*(connection refused|connection reset|timed out)"),
+    ("blocked", r"sign in to confirm(?! your age)|not a bot|http error 403|http error 429"),
+    ("unavailable", r"private video|video unavailable|this video has been removed|not available in your country"
+                    r"|" + _AGE + r"|this live event|premieres"),
+    ("no_format", r"requested format is not available|no video formats found|signature solving failed"
+                  r"|n challenge solving failed"),
+    ("fetch_timeout", r"timed out"),
+)
+
+
+def classify_fetch(message):
+    """The cause word for a failed YouTube fetch from its redacted message."""
+    low = (message or "").lower()
+    for cause, pattern in FETCH_CAUSES:
+        if re.search(pattern, low):
+            return cause
+    return "fetch_other"
 
 
 class _RedactingYdlLogger:
@@ -1119,12 +1157,15 @@ def fetch_youtube_range(url, out_path, range_start, range_end):
             # type only: a DownloadError message can quote the proxy URL
             log.info("yt-dlp failed type=%s attempt=%d", type(exc).__name__, attempt)
             if attempt == 2:
-                raise ClipError("fetch")
+                # the cause from the last attempt's message, redacted first (it
+                # can quote the proxy URL) and classified on what the app may see
+                detail = redact(exc, proxy_secrets(PROXY_URL))
+                raise ClipError("fetch", cause=classify_fetch(detail), detail=detail)
             if os.path.exists(out_path):
                 os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
             time.sleep(FETCH_RETRY_SLEEP)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        raise ClipError("fetch")
+        raise ClipError("fetch", cause="fetch_other", detail="yt-dlp wrote no file")
 
 
 def fetch_source(job, tmp):
@@ -1177,7 +1218,7 @@ def render(job, source_path, file_origin, tmp):
     if out_len > job["max_output_seconds"] + 1e-6:
         raise ClipError("too_long")
     if out_len < 0.5:
-        raise ClipError("input")
+        raise ClipError("input", cause="too_short")
     caption_track = None
     if job["cues"] and job["aspect"] != "audio":
         states = caption_states(job["cues"], job["removed"], out_len)
@@ -1199,9 +1240,9 @@ def render(job, source_path, file_origin, tmp):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=job["max_output_seconds"] * 6 + 600)
     except subprocess.TimeoutExpired:
-        raise ClipError("timeout")
-    except OSError:
-        raise ClipError("render")
+        raise ClipError("timeout", cause="encode_timeout")
+    except OSError as exc:
+        raise ClipError("render", cause="encode", detail=type(exc).__name__)
     if proc.returncode != 0 and encoder == "h264_nvenc":
         # A GPU encoder that is listed but cannot open (driver, session cap)
         # falls back to software for this job only.
@@ -1211,10 +1252,13 @@ def render(job, source_path, file_origin, tmp):
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=job["max_output_seconds"] * 6 + 600)
         except subprocess.TimeoutExpired:
-            raise ClipError("timeout")
-    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise ClipError("timeout", cause="encode_timeout")
+    if proc.returncode != 0:
         log.info("ffmpeg failed rc=%s stderr_lines=%d", proc.returncode, len((proc.stderr or "").splitlines()))
-        raise ClipError("render")
+        raise ClipError("render", cause="encode", detail=_stderr_tail(proc.stderr))
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        log.info("ffmpeg wrote nothing rc=0")
+        raise ClipError("render", cause="encode_empty")
     return out_path, encoder
 
 
@@ -1241,7 +1285,11 @@ def run(job_input):
     fetch_ms = render_ms = None
     cache_hit = None
     try:
-        job = validate_input(job_input)
+        try:
+            job = validate_input(job_input)
+        except ClipError as exc:
+            exc.cause = exc.cause or "input"
+            raise
         tmp = tempfile.mkdtemp(prefix="clip-")
         t0 = time.monotonic()
         source_path, origin, cache_hit, src_bytes = fetch_source(job, tmp)
