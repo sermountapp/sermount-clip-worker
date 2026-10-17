@@ -61,6 +61,13 @@ Output (always; the handler never raises):
 `reason` on failure is one of eight words, which the app maps (anything else reads as a worker
 failure there). Since v0.2.5 `cause` says which kind, and `cause_detail` carries the last
 attempt's message, redacted (no proxy fragment), one line, at most 300 characters, or `null`.
+Since v0.2.6 a YouTube fetch whose ffmpeg failed ends with ffmpeg's own last error line:
+`ERROR: ffmpeg exited with code 8 | ffmpeg: Error opening input files: Connection refused`.
+yt-dlp runs that ffmpeg at `-loglevel quiet`, so the worker reads it from an `FFREPORT` file
+(`level=16`, errors only) in the job's temp dir, set for the download alone and deleted after each
+attempt; a URL in the line keeps only its scheme and host, and the yt-dlp text is cut first so the
+ffmpeg line survives the cap. ffmpeg does not name a proxy 407 (4.4 and 8.1 both say "Server
+returned 4XX Client Error, but not one of 40{0,1,3,4}"), so such a fetch still reads `fetch_other`.
 Network errors carry the exception class only (their message quotes the signed URL).
 
 | `reason` | Meaning | `cause` |
