@@ -26,14 +26,21 @@ the output clock with the same list, so a caption never points at a cut word.
 Output (always; the handler never raises to RunPod):
 
     {"ok": true|false, "reason": null|"input|fetch|cache|render|upload|too_long|timeout|error",
-     "bytes", "duration", "fetch_ms", "render_ms", "exec_ms", "cache_hit", "encoder", "image_tag"}
+     "bytes", "duration", "fetch_ms", "render_ms", "exec_ms", "cache_hit", "encoder", "image_tag",
+     "cause": null|"<one word>", "cause_detail": null|"<redacted, one line, <= 300 chars>",
+     "proxy_probe": "ok|auth|unreachable|skipped", "proxy_fp": "<8 hex>"|null, "ports_tried": int|null}
+  (v0.2.5: `reason` keeps its eight words, which the app maps; `cause` says
+  which kind, e.g. fetch → proxy_config | proxy_auth | proxy_unreachable |
+  blocked | unavailable | no_format | fetch_timeout | fetch_other.)
 
 Rules (from SermonVault's measured findings, docs/edit-mode-clips-brief.md):
   - Fetch only the range: cache GET first; on a miss yt-dlp download_ranges
     over [start - 10, end + 10] with force_keyframes_at_cuts, 1080p cap, the
     encoder args in external_downloader_args (NOT postprocessor_args, which
     FFmpegFD ignores) AND merge_output_format mp4, then PUT the range to the
-    cache. One fetch at a time per worker process.
+    cache. One fetch at a time per worker process. YouTube needs PROXY_URL
+    (no proxy fails fast); three attempts rotate PROXY_PORTS inside a
+    FETCH_WALL_SECS clock, each stall bounded by a 20 s socket timeout.
   - Render: trim to the exact range, cut `removed` with select/aselect,
     centre-crop and scale, burn captions (never -c:v copy with a burn),
     loudnorm when asked. h264_nvenc when present, else libx264.
@@ -51,6 +58,7 @@ Rules (from SermonVault's measured findings, docs/edit-mode-clips-brief.md):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -61,11 +69,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
-IMAGE_TAG = "v0.2.4"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.5"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -137,7 +145,28 @@ FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
 FETCH_RETRY_SLEEP = 2.0
+FETCH_ATTEMPTS = 3              # attempt n leaves through PROXY_URLS[(n - 1) % len]
 YTDLP_MESSAGE_CAP = 300
+# One GET through the proxy at boot (v0.2.5): a ~1 KB JSON the vendor serves for
+# exactly this. 200 ok, 407 auth, anything else unreachable. It never stops
+# the worker: the vendor endpoint can be down while fetches work.
+PROXY_PROBE_URL = "https://ip.decodo.com/json"
+PROXY_PROBE_TIMEOUT = (5, 10)
+
+def _env_secs(name, default):
+    try:
+        v = float(os.environ.get(name) or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+# The fetch's clocks (v0.2.5). Every attempt must finish inside the wall
+# clock, checked between attempts; inside an attempt, yt-dlp's socket timeout
+# and ffmpeg's -rw_timeout (per-socket inactivity, not total) bound a stall,
+# since yt-dlp's FFmpegFD waits on ffmpeg with no timeout of its own.
+FETCH_WALL_SECS = _env_secs("FETCH_WALL_SECS", 600.0)
+SOCKET_TIMEOUT = 20.0
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("clips")
@@ -167,13 +196,114 @@ def proxy_from_env(value):
     return (value.strip(), "on") if ok else (None, "invalid")
 
 
+def proxy_fingerprint(value):
+    """The first 8 hex chars of sha256 of the stripped value, or None when
+    unset. Not the secret and not derivable from it without the secret: the
+    operator hashes the value they believe is set and compares
+    (printf '%s' "$PROXY_URL" | shasum -a 256 | cut -c1-8)."""
+    if not value or not value.strip():
+        return None
+    return hashlib.sha256(value.strip().encode()).hexdigest()[:8]
+
+
+# Port rotation (v0.2.5), ported verbatim from the app's app/proxy.py
+# (is_valid_proxy_url, get_proxy_url, _parse_proxy_ports,
+# _proxy_url_with_port, get_proxy_urls) so PROXY_PORTS means the same thing
+# on both sides: PROXY_URL holds the credentials, PROXY_PORTS (optional,
+# comma or space separated) the ports to rotate through.
+
+def is_valid_proxy_url(value: str | None) -> bool:
+    """Return True when value is a proxy URL shape yt-dlp can use."""
+    if not value or not value.strip():
+        return False
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in PROXY_SCHEMES:
+        return False
+    if not parsed.hostname or not parsed.port:
+        return False
+    return True
+
+
+def get_proxy_url(value: str | None) -> str | None:
+    """Return a stripped proxy URL only if it is syntactically usable."""
+    if not is_valid_proxy_url(value):
+        return None
+    return value.strip()
+
+
+def _parse_proxy_ports(value: str | None) -> list[int]:
+    """Parse comma/space separated proxy ports, dropping invalid entries."""
+    if not value or not value.strip():
+        return []
+    ports: list[int] = []
+    for raw in re.split(r"[\s,]+", value.strip()):
+        if not raw:
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            log.warning("PROXY_PORTS: ignoring non-integer entry %r", raw)
+            continue
+        if port < 1 or port > 65535:
+            log.warning("PROXY_PORTS: ignoring out-of-range port %r", raw)
+            continue
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _proxy_url_with_port(proxy_url: str, port: int) -> str:
+    """Return proxy_url with port replaced while preserving raw credentials."""
+    parsed = urlparse(proxy_url.strip())
+    raw_auth = ""
+    if "@" in parsed.netloc:
+        raw_auth = parsed.netloc.rsplit("@", 1)[0] + "@"
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{raw_auth}{host}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def get_proxy_urls(value: str | None, ports_value: str | None = None) -> list[str]:
+    """Return one or more syntactically valid proxy URLs for yt-dlp.
+
+    PROXY_URL remains the credential/source of truth. Optional PROXY_PORTS
+    lets deployments rotate through provider ports without duplicating
+    credentials in multiple env vars.
+    """
+    base = get_proxy_url(value)
+    if not base:
+        return []
+    ports = _parse_proxy_ports(ports_value)
+    if not ports:
+        return [base]
+
+    urls: list[str] = []
+    for port in ports:
+        candidate = _proxy_url_with_port(base, port)
+        if is_valid_proxy_url(candidate) and candidate not in urls:
+            urls.append(candidate)
+    return urls or [base]
+
+
 PROXY_URL, PROXY_STATE = proxy_from_env(os.environ.get("PROXY_URL"))
+PROXY_URLS = get_proxy_urls(PROXY_URL, os.environ.get("PROXY_PORTS")) if PROXY_STATE == "on" else []
+PROXY_FP = proxy_fingerprint(os.environ.get("PROXY_URL"))
+PROXY_PROBE = None      # ok | auth | unreachable | skipped, set once at boot (None: not probed)
+PROXY_PROBE_MS = None
 
 
 class ClipError(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, cause=None, detail=None, ports_tried=None):
         super().__init__(reason)
         self.reason = reason
+        self.cause = cause
+        self.detail = detail
+        self.ports_tried = ports_tried
 
 
 # ── input ────────────────────────────────────────────────────────────────────
@@ -546,11 +676,11 @@ def write_caption_track(tmp, states, out_len, width, height):
            "-vf", "fps=30,format=argb", "-c:v", "qtrle", "-t", f"{out_len:.3f}", track]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(600, out_len * 10))
-    except (subprocess.TimeoutExpired, OSError):
-        raise ClipError("render")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise ClipError("render", cause="caption_track", detail=type(exc).__name__)
     if proc.returncode != 0 or not os.path.exists(track):
         log.info("caption track failed rc=%s", proc.returncode)
-        raise ClipError("render")
+        raise ClipError("render", cause="caption_track", detail=_stderr_tail(proc.stderr))
     return track
 
 
@@ -965,24 +1095,28 @@ def download(url, dest, timeout=DOWNLOAD_TIMEOUT):
     if p.scheme == "file":
         try:
             shutil.copyfile(p.path, dest)
-            return os.path.getsize(dest)
-        except OSError:
-            raise ClipError("fetch")
+            size = os.path.getsize(dest)
+        except OSError as exc:
+            raise ClipError("fetch", cause="source_network", detail=type(exc).__name__)
+        if size == 0:
+            raise ClipError("fetch", cause="source_empty")
+        return size
     total = 0
     try:
         with requests.get(url, stream=True, timeout=timeout) as resp:
             if resp.status_code != 200:
-                raise ClipError("fetch")
+                raise ClipError("fetch", cause="source_http", detail=f"HTTP {resp.status_code}")
             with open(dest, "wb") as fh:
                 for chunk in resp.iter_content(DOWNLOAD_CHUNK):
                     total += len(chunk)
                     if total > MAX_SOURCE_BYTES:
-                        raise ClipError("fetch")
+                        raise ClipError("fetch", cause="source_too_big")
                     fh.write(chunk)
-    except requests.RequestException:
-        raise ClipError("fetch")
+    except requests.RequestException as exc:
+        # the class only: the message quotes the signed URL
+        raise ClipError("fetch", cause="source_network", detail=type(exc).__name__)
     if total == 0:
-        raise ClipError("fetch")
+        raise ClipError("fetch", cause="source_empty")
     return total
 
 
@@ -993,16 +1127,16 @@ def upload(url, token, path, content_type, reason):
         try:
             shutil.copyfile(path, p.path)
             return
-        except OSError:
-            raise ClipError(reason)
+        except OSError as exc:
+            raise ClipError(reason, cause="upload_network", detail=type(exc).__name__)
     try:
         with open(path, "rb") as fh:
             resp = requests.put(_with_token(url, token), data=fh, timeout=UPLOAD_TIMEOUT,
                                 headers={"Content-Type": content_type, "x-upsert": "true"})
-    except requests.RequestException:
-        raise ClipError(reason)
+    except requests.RequestException as exc:
+        raise ClipError(reason, cause="upload_network", detail=type(exc).__name__)
     if resp.status_code >= 300:
-        raise ClipError(reason)
+        raise ClipError(reason, cause="upload_http", detail=f"HTTP {resp.status_code}")
 
 
 # ── fetch ────────────────────────────────────────────────────────────────────
@@ -1027,12 +1161,55 @@ def proxy_secrets(proxy_url):
     return tuple(sorted((p for p in parts if p), key=len, reverse=True))
 
 
+def proxy_secrets_all(urls):
+    """proxy_secrets over every rotation URL: the user, password and host are
+    the same for all of them; only each full URL (its port) adds an entry."""
+    parts = set()
+    for u in urls:
+        parts.update(proxy_secrets(u))
+    return tuple(sorted(parts, key=len, reverse=True))
+
+
 def redact(msg, secrets):
     """One line, no proxy fragment, at most YTDLP_MESSAGE_CAP characters."""
     text = " ".join(str(msg).split())
     for secret in secrets:
         text = text.replace(secret, "[proxy]")
     return text[:YTDLP_MESSAGE_CAP]
+
+
+def _stderr_tail(stderr):
+    """ffmpeg's last stderr line (it runs at -loglevel error; the inputs are
+    local temp files, captions are pictures), one line, capped; or None."""
+    lines = [ln for ln in (stderr or "").splitlines() if ln.strip()]
+    return redact(lines[-1], ()) if lines else None
+
+
+# Fetch causes (v0.2.5), first match wins, on the REDACTED message: the most
+# specific first, so a wording change downgrades to fetch_other, never to a
+# wrong word. "Names the proxy" means the message says proxy (a quoted URL
+# reads [proxy] by then).
+_AGE = r"confirm your age|age[- ]restricted"
+FETCH_CAUSES = (
+    ("proxy_auth", r"\b407\b"),
+    ("proxy_unreachable", r"unable to connect to proxy|tunnel connection failed|proxyerror"
+                          r"|(?=.*proxy).*(connection refused|connection reset|timed out)"),
+    ("blocked", r"sign in to confirm(?! your age)|not a bot|http error 403|http error 429"),
+    ("unavailable", r"private video|video unavailable|this video has been removed|not available in your country"
+                    r"|" + _AGE + r"|this live event|premieres"),
+    ("no_format", r"requested format is not available|no video formats found|signature solving failed"
+                  r"|n challenge solving failed"),
+    ("fetch_timeout", r"timed out"),
+)
+
+
+def classify_fetch(message):
+    """The cause word for a failed YouTube fetch from its redacted message."""
+    low = (message or "").lower()
+    for cause, pattern in FETCH_CAUSES:
+        if re.search(pattern, low):
+            return cause
+    return "fetch_other"
 
 
 class _RedactingYdlLogger:
@@ -1057,13 +1234,15 @@ class _RedactingYdlLogger:
         log.info("yt-dlp error: %s", redact(msg, self.secrets))
 
 
-def ytdlp_options(out_path, range_start, range_end):
+def ytdlp_options(out_path, range_start, range_end, proxy=None, socket_timeout=SOCKET_TIMEOUT):
     """yt-dlp options for one range. The encoder arguments go in
     external_downloader_args (FFmpegFD reads those; postprocessor_args is
     ignored with download_ranges) AND merge_output_format pins mp4: without
     the pin the container defaults to webm, which rejects H.264 and forces a
-    VP9 software transcode of every fetch (SermonVault §5)."""
+    VP9 software transcode of every fetch (SermonVault §5). `proxy` is this
+    attempt's proxy URL (PROXY_URL when not given)."""
     import yt_dlp
+    proxy = proxy or PROXY_URL
     opts = {
         "format": "bestvideo[height<=1080]+bestaudio/best",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(range_start, range_end)]),
@@ -1074,62 +1253,100 @@ def ytdlp_options(out_path, range_start, range_end):
         "quiet": True, "no_warnings": True, "noprogress": True,
         "retries": 3, "fragment_retries": 3,
         "noplaylist": True,
-        "logger": _RedactingYdlLogger(proxy_secrets(PROXY_URL)),
+        "socket_timeout": socket_timeout,
+        "logger": _RedactingYdlLogger(proxy_secrets_all([proxy] + list(PROXY_URLS))),
     }
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
+    # Before every -i: a media socket idle this long ends ffmpeg (microseconds).
+    ffmpeg_i = ["-rw_timeout", str(int(socket_timeout * 1_000_000))]
+    if proxy:
+        opts["proxy"] = proxy
         # With download_ranges FFmpegFD fetches the media; yt-dlp hands it
         # the proxy only as env vars, so pass it as ffmpeg's own input option
         # too (placed before every -i). The media URL is bound to the IP that
         # resolved it, so ffmpeg must leave through the same proxy.
-        opts["external_downloader_args"]["ffmpeg_i"] = ["-http_proxy", PROXY_URL]
+        ffmpeg_i += ["-http_proxy", proxy]
+    opts["external_downloader_args"]["ffmpeg_i"] = ffmpeg_i
     return opts
 
 
+def _now():
+    return time.monotonic()
+
+
 def fetch_youtube_range(url, out_path, range_start, range_end):
+    """Download the range; returns ports_tried (distinct proxy ports used).
+    Attempt n leaves through urls[(n - 1) % len(urls)]: yt-dlp's requests
+    and ffmpeg's -http_proxy change together, since the media URL is bound
+    to the IP that resolved it."""
     import yt_dlp
-    opts = ytdlp_options(out_path, range_start, range_end)
-    for attempt in (1, 2):
+    urls = PROXY_URLS or [PROXY_URL]
+    secrets = proxy_secrets_all(urls)
+    deadline = _now() + FETCH_WALL_SECS
+    used = []
+    last = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        remaining = deadline - _now()
+        if remaining <= 0:
+            # Cut between attempts. The last message (if any) stays as the detail.
+            raise ClipError("fetch", cause="fetch_timeout", ports_tried=len(used),
+                            detail=last or f"no file within FETCH_WALL_SECS={FETCH_WALL_SECS:g}")
+        proxy = urls[(attempt - 1) % len(urls)]
+        if proxy not in used:
+            used.append(proxy)
+        # an attempt's own stall budget never runs past the wall clock
+        opts = ytdlp_options(out_path, range_start, range_end, proxy=proxy,
+                             socket_timeout=max(1.0, min(SOCKET_TIMEOUT, remaining)))
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
             break
         except Exception as exc:
             # type only: a DownloadError message can quote the proxy URL
-            log.info("yt-dlp failed type=%s attempt=%d", type(exc).__name__, attempt)
-            if attempt == 2:
-                raise ClipError("fetch")
+            log.info("yt-dlp failed type=%s attempt=%d port=%s", type(exc).__name__, attempt,
+                     urlparse(proxy).port if proxy else "-")
+            # redacted first (it can quote the proxy URL), classified on what the app may see
+            last = redact(exc, secrets)
+            if attempt == FETCH_ATTEMPTS:
+                raise ClipError("fetch", cause=classify_fetch(last), detail=last, ports_tried=len(used))
             if os.path.exists(out_path):
                 os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
-            time.sleep(FETCH_RETRY_SLEEP)
+            time.sleep(min(FETCH_RETRY_SLEEP, max(0.0, deadline - _now())))
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        raise ClipError("fetch")
+        raise ClipError("fetch", cause="fetch_other", detail="yt-dlp wrote no file", ports_tried=len(used))
+    return len(used)
 
 
 def fetch_source(job, tmp):
-    """(path, file_origin, cache_hit, bytes). YouTube: cache GET, else yt-dlp
-    then cache PUT. Audio: the signed stored-audio URL (its own clock, origin 0)."""
+    """(path, file_origin, cache_hit, bytes, ports_tried). YouTube: cache GET,
+    else yt-dlp then cache PUT (ports_tried 0 on a cache hit). Audio: the
+    signed stored-audio URL (its own clock, origin 0; ports_tried None)."""
     if job["kind"] == "audio":
         path = os.path.join(tmp, "source.audio")
         size = download(job["url"], path)
-        return path, 0.0, False, size
+        return path, 0.0, False, size, None
+    if PROXY_STATE != "on":
+        # v0.2.5: no proxy is not a configuration (YouTube walls datacenter
+        # IPs). Fail before the cache GET too, so a misconfigured endpoint
+        # shows on the first job, not on the first cache miss.
+        raise ClipError("fetch", cause="proxy_config",
+                        detail="PROXY_URL is not set" if PROXY_STATE == "off" else "PROXY_URL is invalid")
     rs, re_ = job.get("fetch") or padded_range(job["start"], job["end"])
     path = os.path.join(tmp, "source.mp4")
     if job["cache_get"]:
         try:
             size = download(job["cache_get"], path)
-            return path, float(rs), True, size
+            return path, float(rs), True, size, 0
         except ClipError:
             log.info("cache miss")
     with _FETCH_LOCK:
-        fetch_youtube_range(job["url"], path, rs, re_)
+        ports_tried = fetch_youtube_range(job["url"], path, rs, re_)
     size = os.path.getsize(path)
     if job["cache_put"]:
         try:
             upload(job["cache_put"], job["cache_token"], path, "video/mp4", "cache")
         except ClipError:
             log.info("cache put failed; rendering anyway")
-    return path, float(rs), False, size
+    return path, float(rs), False, size, ports_tried
 
 
 # ── render ───────────────────────────────────────────────────────────────────
@@ -1150,7 +1367,7 @@ def render(job, source_path, file_origin, tmp):
     if out_len > job["max_output_seconds"] + 1e-6:
         raise ClipError("too_long")
     if out_len < 0.5:
-        raise ClipError("input")
+        raise ClipError("input", cause="too_short")
     caption_track = None
     if job["cues"] and job["aspect"] != "audio":
         states = caption_states(job["cues"], job["removed"], out_len)
@@ -1172,9 +1389,9 @@ def render(job, source_path, file_origin, tmp):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=job["max_output_seconds"] * 6 + 600)
     except subprocess.TimeoutExpired:
-        raise ClipError("timeout")
-    except OSError:
-        raise ClipError("render")
+        raise ClipError("timeout", cause="encode_timeout")
+    except OSError as exc:
+        raise ClipError("render", cause="encode", detail=type(exc).__name__)
     if proc.returncode != 0 and encoder == "h264_nvenc":
         # A GPU encoder that is listed but cannot open (driver, session cap)
         # falls back to software for this job only.
@@ -1184,19 +1401,29 @@ def render(job, source_path, file_origin, tmp):
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=job["max_output_seconds"] * 6 + 600)
         except subprocess.TimeoutExpired:
-            raise ClipError("timeout")
-    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise ClipError("timeout", cause="encode_timeout")
+    if proc.returncode != 0:
         log.info("ffmpeg failed rc=%s stderr_lines=%d", proc.returncode, len((proc.stderr or "").splitlines()))
-        raise ClipError("render")
+        raise ClipError("render", cause="encode", detail=_stderr_tail(proc.stderr))
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        log.info("ffmpeg wrote nothing rc=0")
+        raise ClipError("render", cause="encode_empty")
     return out_path, encoder
 
 
 # ── the job ──────────────────────────────────────────────────────────────────
 
-def _failure(reason, started, **extra):
+def _diagnostics(cause=None, cause_detail=None):
+    """v0.2.5: on every result. `reason` keeps its eight words (the app maps
+    them); these are new fields the app ignores until it reads them."""
+    return {"cause": cause, "cause_detail": cause_detail, "proxy_probe": PROXY_PROBE, "proxy_fp": PROXY_FP}
+
+
+def _failure(reason, started, cause=None, cause_detail=None, **extra):
     out = {"ok": False, "reason": reason, "bytes": None, "duration": None, "fetch_ms": None,
            "render_ms": None, "exec_ms": int((time.monotonic() - started) * 1000), "cache_hit": None,
            "encoder": None, "image_tag": IMAGE_TAG}
+    out.update(_diagnostics(cause, cause_detail))
     out.update(extra)
     return out
 
@@ -1205,12 +1432,16 @@ def run(job_input):
     started = time.monotonic()
     tmp = None
     fetch_ms = render_ms = None
-    cache_hit = None
+    cache_hit = ports_tried = None
     try:
-        job = validate_input(job_input)
+        try:
+            job = validate_input(job_input)
+        except ClipError as exc:
+            exc.cause = exc.cause or "input"
+            raise
         tmp = tempfile.mkdtemp(prefix="clip-")
         t0 = time.monotonic()
-        source_path, origin, cache_hit, src_bytes = fetch_source(job, tmp)
+        source_path, origin, cache_hit, src_bytes, ports_tried = fetch_source(job, tmp)
         fetch_ms = int((time.monotonic() - t0) * 1000)
         t1 = time.monotonic()
         out_path, encoder = render(job, source_path, origin, tmp)
@@ -1221,25 +1452,96 @@ def run(job_input):
         upload(job["out_put"], job["out_token"], out_path, content_type, "upload")
         exec_ms = int((time.monotonic() - started) * 1000)
         log.info("rendered kind=%s aspect=%s cache_hit=%s source_bytes=%d out_bytes=%d duration=%s removed=%d "
-                 "captions=%s encoder=%s fetch_ms=%d render_ms=%d exec_ms=%d",
+                 "captions=%s encoder=%s fetch_ms=%d render_ms=%d exec_ms=%d ports_tried=%s",
                  job["kind"], job["aspect"], cache_hit, src_bytes, size, duration, len(job["removed"]),
-                 bool(job["cues"]), encoder, fetch_ms, render_ms, exec_ms)
+                 bool(job["cues"]), encoder, fetch_ms, render_ms, exec_ms, ports_tried)
         return {"ok": True, "reason": None, "bytes": size, "duration": duration, "fetch_ms": fetch_ms,
                 "render_ms": render_ms, "exec_ms": exec_ms, "cache_hit": cache_hit, "encoder": encoder,
-                "image_tag": IMAGE_TAG}
+                "image_tag": IMAGE_TAG, **_diagnostics(), "ports_tried": ports_tried}
     except ClipError as exc:
-        log.info("not rendered reason=%s", exc.reason)
-        return _failure(exc.reason, started, fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
+        if exc.ports_tried is not None:
+            ports_tried = exc.ports_tried
+        log.info("not rendered reason=%s cause=%s", exc.reason, exc.cause)
+        return _failure(exc.reason, started, exc.cause, exc.detail,
+                        fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit, ports_tried=ports_tried)
     except Exception as exc:  # never raise to RunPod
         log.warning("not rendered reason=error type=%s", type(exc).__name__)
-        return _failure("error", started, fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
+        return _failure("error", started, type(exc).__name__,
+                        fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit, ports_tried=ports_tried)
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def probe_proxy(proxy_url, state):
+    """(result, ms): one GET of PROXY_PROBE_URL through the proxy, no retries.
+    An HTTPS GET through an HTTP proxy meets a 407 at the CONNECT, so requests
+    raises ProxyError ("Tunnel connection failed: 407 ...") instead of
+    returning the status: both shapes are read. Nothing about the exception
+    is logged or kept beyond the word."""
+    if state != "on":
+        return "skipped", None
+    t0 = time.monotonic()
+    try:
+        with requests.get(PROXY_PROBE_URL, proxies={"http": proxy_url, "https": proxy_url},
+                          timeout=PROXY_PROBE_TIMEOUT) as resp:
+            status = resp.status_code
+        result = "ok" if status == 200 else "auth" if status == 407 else "unreachable"
+    except requests.exceptions.ProxyError as exc:
+        result = "auth" if re.search(r"\b407\b", str(exc)) else "unreachable"
+    except Exception:
+        result = "unreachable"
+    return result, int((time.monotonic() - t0) * 1000)
+
+
+def _first_line(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return ""
+    return (out.splitlines() or [""])[0]
+
+
+def tool_versions():
+    """{ytdlp, ffmpeg, runpod, js_runtime}: what this image actually holds."""
+    try:
+        import yt_dlp.version
+        ytdlp = yt_dlp.version.__version__
+    except Exception:
+        ytdlp = "none"
+    try:
+        import runpod
+        rp = getattr(runpod, "__version__", "unknown")
+    except Exception:
+        rp = "none"
+    ff = _first_line([FFMPEG, "-version"]).split()          # "ffmpeg version 6.1.1 Copyright ..."
+    deno = _first_line(["deno", "--version"]).split()       # "deno 2.9.5 (stable, release, ...)"
+    return {"ytdlp": ytdlp, "ffmpeg": ff[2] if len(ff) > 2 and ff[1] == "version" else "none", "runpod": rp,
+            "js_runtime": " ".join(deno[:2]) if len(deno) >= 2 and deno[0] == "deno" else "none"}
+
+
+def boot_line(encoder, versions, proxy_urls, state, fp, probe, probe_ms):
+    """The one boot line. Host and user are not secret (the README's
+    standard: the username shows in the vendor's dashboard); the password
+    and the URL never appear, only the fingerprint. proxy_host is the first
+    rotation port; proxy_ports how many there are."""
+    host = user = "-"
+    if state == "on" and proxy_urls:
+        parsed = urlparse(proxy_urls[0])
+        host = f"{parsed.hostname}:{parsed.port}"
+        user = parsed.username or "-"
+    return (f"clip worker {IMAGE_TAG} encoder={encoder} ytdlp={versions['ytdlp']} ffmpeg={versions['ffmpeg']} "
+            f"runpod={versions['runpod']} js_runtime={versions['js_runtime']} proxy={state} proxy_host={host} "
+            f"proxy_ports={len(proxy_urls) if state == 'on' else 0} proxy_user={user} proxy_fp={fp or '-'} proxy_probe={probe or '-'} "
+            f"probe_ms={'-' if probe_ms is None else probe_ms}")
+
+
 def log_startup():
-    log.info("clip worker %s encoder=%s proxy=%s", IMAGE_TAG, _ENCODER, PROXY_STATE)
+    """Probe the proxy (once; every result carries the word), then log the boot line."""
+    global PROXY_PROBE, PROXY_PROBE_MS
+    urls = PROXY_URLS or ([PROXY_URL] if PROXY_URL else [])
+    PROXY_PROBE, PROXY_PROBE_MS = probe_proxy(urls[0] if urls else None, PROXY_STATE)
+    log.info("%s", boot_line(_ENCODER, tool_versions(), urls, PROXY_STATE, PROXY_FP, PROXY_PROBE, PROXY_PROBE_MS))
 
 
 def handler(job):
