@@ -1194,11 +1194,20 @@ def _ffreport_path(out_path, attempt):
     return None if any(c in path for c in ":,'\\") else path
 
 
+# A URL in an ffmpeg line keeps its scheme and host; the path and query go.
+# ffmpeg 4.4 (the image's) writes the input URL first ("<url>: Connection
+# refused"), and a signed googlevideo URL is longer than YTDLP_MESSAGE_CAP: kept
+# whole, the cap would cut the error and leave the URL, whose numbers
+# (dur=407.2) could also match a cause pattern.
+_URL_TAIL = re.compile(r"\b([a-z][a-z0-9+.-]*://[^/\s?#]+)\S*?(?=:\s|:$|\s|$)", re.IGNORECASE)
+
+
 def _report_tail(path, secrets):
-    """The last non-empty line of an ffmpeg report, redacted; or None. The
-    report opens with "Command line:" and the argv on the next line, which
-    carries -http_proxy and the media URL: everything up to it is dropped,
-    so a report with no error line has no tail rather than the argv."""
+    """The last non-empty line of an ffmpeg report, URLs cut to their host,
+    redacted; or None. The report opens with "Command line:" and the argv on
+    the next line, which carries -http_proxy and the media URL: everything up
+    to it is dropped, so a report with no error line has no tail rather than
+    the argv."""
     try:
         with open(path, errors="replace") as fh:
             lines = fh.read().splitlines()
@@ -1207,7 +1216,7 @@ def _report_tail(path, secrets):
     if "Command line:" in lines:
         lines = lines[lines.index("Command line:") + 2:]
     lines = [ln for ln in lines if ln.strip()]
-    return redact(lines[-1], secrets) if lines else None
+    return redact(_URL_TAIL.sub(r"\1", lines[-1]), secrets) if lines else None
 
 
 def _with_tail(message, tail):
