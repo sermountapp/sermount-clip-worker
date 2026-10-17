@@ -26,6 +26,7 @@ def proxy_on(monkeypatch):
     is fictitious; no test reaches it (fetches are faked or file://)."""
     monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
     monkeypatch.setattr(handler, "PROXY_STATE", "on")
+    monkeypatch.setattr(handler, "PROXY_URLS", [])     # no PROXY_PORTS: the fetch uses [PROXY_URL]
     monkeypatch.setattr(handler, "PROXY_FP", handler.proxy_fingerprint(SECRET_PROXY))
     monkeypatch.setattr(handler, "PROXY_PROBE", "ok")
     monkeypatch.setattr(handler, "PROXY_PROBE_MS", 120)
@@ -213,15 +214,29 @@ def test_fetch_retries_once_then_reports_fetch(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(1, calls))
     out = tmp_path / "once.mp4"
-    handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(out), 90, 118)
+    assert handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(out), 90, 118) == 1
     assert len(calls) == 2 and out.stat().st_size > 0
-    assert calls[1]["proxy"] == SECRET_PROXY  # same options on the retry
+    assert calls[1]["proxy"] == SECRET_PROXY  # one URL (no PROXY_PORTS): the same port on the retry
 
     calls = []
-    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(2, calls))
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(3, calls))
     with pytest.raises(handler.ClipError) as err:
-        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "twice.mp4"), 90, 118)
-    assert err.value.reason == "fetch" and len(calls) == 2
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "thrice.mp4"), 90, 118)
+    assert err.value.reason == "fetch" and len(calls) == 3 and err.value.cause == "blocked" and err.value.ports_tried == 1
+
+    # v0.2.5: two ports, three attempts: 10001, 10002, 10001; yt-dlp and ffmpeg change together
+    a, b = (handler._proxy_url_with_port(SECRET_PROXY, p) for p in (10001, 10002))
+    monkeypatch.setattr(handler, "PROXY_URLS", [a, b])
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(3, calls))
+    with pytest.raises(handler.ClipError) as err:
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "rot.mp4"), 90, 118)
+    assert [c["proxy"] for c in calls] == [a, b, a] and err.value.ports_tried == 2
+    assert [c["external_downloader_args"]["ffmpeg_i"][-1] for c in calls] == [a, b, a]
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(1, calls))
+    assert handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "rot2.mp4"), 90, 118) == 2
+    assert [c["proxy"] for c in calls] == [a, b]
 
 
 def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path, capsys):
@@ -242,18 +257,20 @@ def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path, capsys):
         monkeypatch.setattr(handler, "_ENCODER", "libx264")
         monkeypatch.setattr(handler, "probe_proxy", lambda url, state: ("auth", 41))
         handler.log_startup()
-        monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(2, []))
+        monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(3, []))
         result = handler.run(_job())
     finally:
         handler.log.removeHandler(grab)
     boot = lines.pop(0)
     assert boot.startswith(f"clip worker {handler.IMAGE_TAG} encoder=libx264 ") and " proxy=on " in boot
     # host and user are shown in the boot line ONLY (not secret); never the password or the URL
-    assert "proxy_host=gate.example.test:10001 proxy_user=user-sp1 " in boot and "proxy_probe=auth probe_ms=41" in boot
+    assert "proxy_host=gate.example.test:10001 proxy_ports=1 proxy_user=user-sp1 " in boot and "proxy_probe=auth probe_ms=41" in boot
     assert "s3cr3t" not in boot and SECRET_PROXY not in boot
     assert any("yt-dlp failed type=DownloadError attempt=1" in ln for ln in lines)
     assert any("yt-dlp failed type=DownloadError attempt=2" in ln for ln in lines)
-    assert result["ok"] is False and result["reason"] == "fetch"
+    assert any("yt-dlp failed type=DownloadError attempt=3 port=10001" in ln for ln in lines)
+    assert result["ok"] is False and result["reason"] == "fetch" and result["cause"] == "blocked"
+    assert any(ln.endswith("not rendered reason=fetch cause=blocked") for ln in lines)
     assert any("yt-dlp error: ERROR: [youtube] x: Sign in to confirm you're not a bot (via [proxy])" in ln for ln in lines)
     out = capsys.readouterr()
     assert out.out == "" and out.err == ""
@@ -790,7 +807,7 @@ def test_the_fetch_window_from_the_app_is_the_cached_files_origin(quiet, monkeyp
     monkeypatch.setattr(handler, "download", lambda *a, **k: (_ for _ in ()).throw(handler.ClipError("fetch")))
     job = handler.validate_input(_job(source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                               "start": 189.75, "end": 194.25, "fetch_start": 180, "fetch_end": 205}))
-    path, origin, hit, size = handler.fetch_source(job, str(handler.tempfile.mkdtemp()))
+    path, origin, hit, size, ports = handler.fetch_source(job, str(handler.tempfile.mkdtemp()))
     assert events == [(180.0, 205.0)] and origin == 180.0
     # without a window (an older app) the derived one, as before
     job = handler.validate_input(_job(source={"kind": "youtube", "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "start": 189.75, "end": 194.25}))
@@ -916,17 +933,17 @@ FAKE_VERSIONS = {"ytdlp": "2026.08.19", "ffmpeg": "6.1.1", "runpod": "1.12.0", "
 
 def test_boot_line_has_every_field_in_order():
     fp = handler.proxy_fingerprint(SECRET_PROXY)
-    line = handler.boot_line("h264_nvenc", FAKE_VERSIONS, SECRET_PROXY, "on", fp, "ok", 212)
+    line = handler.boot_line("h264_nvenc", FAKE_VERSIONS, [SECRET_PROXY], "on", fp, "ok", 212)
     assert line == (f"clip worker {handler.IMAGE_TAG} encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 "
-                    f"js_runtime=deno 2.9.5 proxy=on proxy_host=gate.example.test:10001 proxy_user=user-sp1 "
+                    f"js_runtime=deno 2.9.5 proxy=on proxy_host=gate.example.test:10001 proxy_ports=1 proxy_user=user-sp1 "
                     f"proxy_fp={fp} proxy_probe=ok probe_ms=212")
     assert "s3cr3t" not in line
-    off = handler.boot_line("libx264", dict(FAKE_VERSIONS, js_runtime="none"), None, "off", None, "skipped", None)
-    assert off.endswith("js_runtime=none proxy=off proxy_host=- proxy_user=- proxy_fp=- proxy_probe=skipped probe_ms=-")
+    off = handler.boot_line("libx264", dict(FAKE_VERSIONS, js_runtime="none"), [], "off", None, "skipped", None)
+    assert off.endswith("js_runtime=none proxy=off proxy_host=- proxy_ports=0 proxy_user=- proxy_fp=- proxy_probe=skipped probe_ms=-")
     # invalid: the fingerprint of what IS set still shows, so the operator can tell which value it holds
     bad = "gate.example.test:10001"
-    inv = handler.boot_line("libx264", FAKE_VERSIONS, None, "invalid", handler.proxy_fingerprint(bad), "skipped", None)
-    assert f"proxy=invalid proxy_host=- proxy_user=- proxy_fp={handler.proxy_fingerprint(bad)} proxy_probe=skipped" in inv
+    inv = handler.boot_line("libx264", FAKE_VERSIONS, [], "invalid", handler.proxy_fingerprint(bad), "skipped", None)
+    assert f"proxy=invalid proxy_host=- proxy_ports=0 proxy_user=- proxy_fp={handler.proxy_fingerprint(bad)} proxy_probe=skipped" in inv
 
 
 def test_proxy_fingerprint_matches_the_readme_recipe():
@@ -1331,3 +1348,97 @@ def test_real_ffmpeg_rw_timeout_ends_a_stalled_input(via_proxy):
     finally:
         srv.close()
     assert proc.returncode != 0 and 1.5 < took < 10, (took, proc.stderr)
+
+
+# ── v0.2.5: PROXY_PORTS rotation, as the app does it ────────────────────────
+
+# The app's own cases (sermount-web tests/unit/test_proxy.py), verbatim.
+APP_PORT_CASES = [
+    (("http://user:pa%2Bss@gate.decodo.com:10002", "10001,10002 10003"),
+     ["http://user:pa%2Bss@gate.decodo.com:10001", "http://user:pa%2Bss@gate.decodo.com:10002",
+      "http://user:pa%2Bss@gate.decodo.com:10003"]),
+    (("http://user:pass@proxy.example.com:8000", "8001,nope,8001,70000"), ["http://user:pass@proxy.example.com:8001"]),
+    (("http://user:pass@proxy.example.com:8000", ""), ["http://user:pass@proxy.example.com:8000"]),
+    (("http://user:pass@proxy.example.com:8000", None), ["http://user:pass@proxy.example.com:8000"]),
+    (("Key", "10001"), []),
+    (("socks5h://u:p@[::1]:7000", "7001 7002"), ["socks5h://u:p@[::1]:7001", "socks5h://u:p@[::1]:7002"]),
+    (("http://user:pass@proxy.example.com:8000", "0, 65536, x"), ["http://user:pass@proxy.example.com:8000"]),
+]
+
+
+@pytest.mark.parametrize("args,want", APP_PORT_CASES)
+def test_get_proxy_urls_matches_the_app(args, want):
+    assert handler.get_proxy_urls(*args) == want
+    app_proxy = os.path.join(os.path.dirname(ROOT), "sermount-web", "app", "proxy.py")
+    if os.path.exists(app_proxy):  # the sibling checkout, when there is one: same answer from its code
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_app_proxy", app_proxy)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.get_proxy_urls(*args) == want
+
+
+def test_the_ported_helpers_are_the_apps_text():
+    """Verbatim, bar the logger's name."""
+    import inspect
+    app_proxy = os.path.join(os.path.dirname(ROOT), "sermount-web", "app", "proxy.py")
+    if not os.path.exists(app_proxy):
+        pytest.skip("no sibling sermount-web checkout")
+    src = open(app_proxy).read()
+    for name in ("_parse_proxy_ports", "_proxy_url_with_port", "get_proxy_urls", "get_proxy_url"):
+        ours = inspect.getsource(getattr(handler, name)).replace("log.", "logger.")
+        assert ours in src, name
+
+
+def test_proxy_secrets_are_unchanged_by_rotation():
+    urls = handler.get_proxy_urls(SECRET_PROXY, "10001 10002 10003")
+    one = set(handler.proxy_secrets(SECRET_PROXY))
+    all_ = set(handler.proxy_secrets_all(urls))
+    # user, password (raw and decoded) and host are the same set; each port's full URL adds itself
+    assert one - {SECRET_PROXY} == all_ - set(urls) == {"user-sp1", "s3cr3t%2Bpw", "s3cr3t+pw", "gate.example.test"}
+    assert set(urls) <= all_
+    for u in urls:
+        assert handler.redact(f"via {u}", handler.proxy_secrets_all(urls)) == "via [proxy]"
+
+
+def test_ports_tried_on_results(quiet, monkeypatch):
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    monkeypatch.setattr(handler, "PROXY_URLS", handler.get_proxy_urls(SECRET_PROXY, "10001 10002"))
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+    monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(1, []))
+    assert handler.run(_job())["ports_tried"] == 2                       # failed on 10001, rendered via 10002
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(3, []))
+    out = handler.run(_job())
+    assert (out["ok"], out["cause"], out["ports_tried"]) == (False, "blocked", 2)
+    monkeypatch.setattr(handler, "download", lambda url, dest, timeout=None: (shutil.copyfile(SAMPLE, dest), 1)[1])
+    assert handler.run(_job(cache={"get_url": "https://supabase.test/c.mp4"}))["ports_tried"] == 0   # cache hit
+    assert handler.run(_audio_job())["ports_tried"] is None
+
+
+def test_rendered_log_line_carries_ports_tried(quiet, monkeypatch):
+    import logging
+    import yt_dlp
+    lines = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(self.format(record))
+
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+    monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(0, []))
+    grab = Grab()
+    handler.log.addHandler(grab)
+    try:
+        assert handler.run(_job())["ok"] is True
+    finally:
+        handler.log.removeHandler(grab)
+    assert any(ln.startswith("rendered kind=youtube") and ln.endswith(" ports_tried=1") for ln in lines), lines
+
+
+def test_boot_line_shows_the_first_port_and_the_count():
+    urls = handler.get_proxy_urls(SECRET_PROXY, "10003 10001 10002")
+    line = handler.boot_line("libx264", FAKE_VERSIONS, urls, "on", "abcd1234", "ok", 90)
+    assert " proxy_host=gate.example.test:10003 proxy_ports=3 proxy_user=user-sp1 " in line
