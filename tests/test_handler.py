@@ -1442,3 +1442,23 @@ def test_boot_line_shows_the_first_port_and_the_count():
     urls = handler.get_proxy_urls(SECRET_PROXY, "10003 10001 10002")
     line = handler.boot_line("libx264", FAKE_VERSIONS, urls, "on", "abcd1234", "ok", 90)
     assert " proxy_host=gate.example.test:10003 proxy_ports=3 proxy_user=user-sp1 " in line
+
+
+# ── v0.2.5: deno + yt-dlp-ejs pinned to what yt-dlp itself pairs ────────────
+
+def test_ejs_and_deno_pins_match_ytdlps_own_metadata():
+    """yt-dlp 2026.08.19 declares yt-dlp-ejs==0.8.0 and (pin-deno) deno==2.9.5;
+    requirements.txt and the Dockerfile must say the same, so a yt-dlp bump
+    without them fails here."""
+    import importlib.metadata
+    import re as _re
+    reqs = importlib.metadata.requires("yt-dlp") or []
+    ejs = {r.split(";")[0].strip() for r in reqs if r.startswith("yt-dlp-ejs==")}
+    deno = {r.split(";")[0].strip() for r in reqs if r.startswith("deno==")}
+    assert len(ejs) == 1 and len(deno) == 1, (ejs, deno)
+    pinned = open(os.path.join(ROOT, "requirements.txt")).read()
+    assert next(iter(ejs)) in pinned.split()
+    docker = open(os.path.join(ROOT, "Dockerfile")).read()
+    assert f"ARG DENO_VERSION={next(iter(deno)).split('==')[1]}" in docker
+    assert _re.search(r"ARG DENO_SHA256=[0-9a-f]{64}\n", docker) and "sha256sum -c -" in docker
+    assert "| head" not in docker.split("ARG DENO_VERSION")[1].split("RUN python3.11 -m venv")[0]   # pipefail: no early-exit pipes
