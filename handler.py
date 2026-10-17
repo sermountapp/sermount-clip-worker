@@ -51,6 +51,7 @@ Rules (from SermonVault's measured findings, docs/edit-mode-clips-brief.md):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -138,6 +139,11 @@ FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
 FETCH_RETRY_SLEEP = 2.0
 YTDLP_MESSAGE_CAP = 300
+# One GET through the proxy at boot (v0.2.5): a ~1 KB JSON the vendor serves for
+# exactly this. 200 ok, 407 auth, anything else unreachable. It never stops
+# the worker: the vendor endpoint can be down while fetches work.
+PROXY_PROBE_URL = "https://ip.decodo.com/json"
+PROXY_PROBE_TIMEOUT = (5, 10)
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("clips")
@@ -167,13 +173,28 @@ def proxy_from_env(value):
     return (value.strip(), "on") if ok else (None, "invalid")
 
 
+def proxy_fingerprint(value):
+    """The first 8 hex chars of sha256 of the stripped value, or None when
+    unset. Not the secret and not derivable from it without the secret: the
+    operator hashes the value they believe is set and compares
+    (printf '%s' "$PROXY_URL" | shasum -a 256 | cut -c1-8)."""
+    if not value or not value.strip():
+        return None
+    return hashlib.sha256(value.strip().encode()).hexdigest()[:8]
+
+
 PROXY_URL, PROXY_STATE = proxy_from_env(os.environ.get("PROXY_URL"))
+PROXY_FP = proxy_fingerprint(os.environ.get("PROXY_URL"))
+PROXY_PROBE = None      # ok | auth | unreachable | skipped, set once at boot (None: not probed)
+PROXY_PROBE_MS = None
 
 
 class ClipError(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, cause=None, detail=None):
         super().__init__(reason)
         self.reason = reason
+        self.cause = cause
+        self.detail = detail
 
 
 # ── input ────────────────────────────────────────────────────────────────────
@@ -1113,6 +1134,12 @@ def fetch_source(job, tmp):
         path = os.path.join(tmp, "source.audio")
         size = download(job["url"], path)
         return path, 0.0, False, size
+    if PROXY_STATE != "on":
+        # v0.2.5: no proxy is not a configuration (YouTube walls datacenter
+        # IPs). Fail before the cache GET too, so a misconfigured endpoint
+        # shows on the first job, not on the first cache miss.
+        raise ClipError("fetch", cause="proxy_config",
+                        detail="PROXY_URL is not set" if PROXY_STATE == "off" else "PROXY_URL is invalid")
     rs, re_ = job.get("fetch") or padded_range(job["start"], job["end"])
     path = os.path.join(tmp, "source.mp4")
     if job["cache_get"]:
@@ -1193,10 +1220,17 @@ def render(job, source_path, file_origin, tmp):
 
 # ── the job ──────────────────────────────────────────────────────────────────
 
-def _failure(reason, started, **extra):
+def _diagnostics(cause=None, cause_detail=None):
+    """v0.2.5: on every result. `reason` keeps its eight words (the app maps
+    them); these are new fields the app ignores until it reads them."""
+    return {"cause": cause, "cause_detail": cause_detail, "proxy_probe": PROXY_PROBE, "proxy_fp": PROXY_FP}
+
+
+def _failure(reason, started, cause=None, cause_detail=None, **extra):
     out = {"ok": False, "reason": reason, "bytes": None, "duration": None, "fetch_ms": None,
            "render_ms": None, "exec_ms": int((time.monotonic() - started) * 1000), "cache_hit": None,
            "encoder": None, "image_tag": IMAGE_TAG}
+    out.update(_diagnostics(cause, cause_detail))
     out.update(extra)
     return out
 
@@ -1226,20 +1260,87 @@ def run(job_input):
                  bool(job["cues"]), encoder, fetch_ms, render_ms, exec_ms)
         return {"ok": True, "reason": None, "bytes": size, "duration": duration, "fetch_ms": fetch_ms,
                 "render_ms": render_ms, "exec_ms": exec_ms, "cache_hit": cache_hit, "encoder": encoder,
-                "image_tag": IMAGE_TAG}
+                "image_tag": IMAGE_TAG, **_diagnostics()}
     except ClipError as exc:
-        log.info("not rendered reason=%s", exc.reason)
-        return _failure(exc.reason, started, fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
+        log.info("not rendered reason=%s cause=%s", exc.reason, exc.cause)
+        return _failure(exc.reason, started, exc.cause, exc.detail,
+                        fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
     except Exception as exc:  # never raise to RunPod
         log.warning("not rendered reason=error type=%s", type(exc).__name__)
-        return _failure("error", started, fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
+        return _failure("error", started, type(exc).__name__,
+                        fetch_ms=fetch_ms, render_ms=render_ms, cache_hit=cache_hit)
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def probe_proxy(proxy_url, state):
+    """(result, ms): one GET of PROXY_PROBE_URL through the proxy, no retries.
+    An HTTPS GET through an HTTP proxy meets a 407 at the CONNECT, so requests
+    raises ProxyError ("Tunnel connection failed: 407 ...") instead of
+    returning the status: both shapes are read. Nothing about the exception
+    is logged or kept beyond the word."""
+    if state != "on":
+        return "skipped", None
+    t0 = time.monotonic()
+    try:
+        with requests.get(PROXY_PROBE_URL, proxies={"http": proxy_url, "https": proxy_url},
+                          timeout=PROXY_PROBE_TIMEOUT) as resp:
+            status = resp.status_code
+        result = "ok" if status == 200 else "auth" if status == 407 else "unreachable"
+    except requests.exceptions.ProxyError as exc:
+        result = "auth" if re.search(r"\b407\b", str(exc)) else "unreachable"
+    except Exception:
+        result = "unreachable"
+    return result, int((time.monotonic() - t0) * 1000)
+
+
+def _first_line(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return ""
+    return (out.splitlines() or [""])[0]
+
+
+def tool_versions():
+    """{ytdlp, ffmpeg, runpod, js_runtime}: what this image actually holds."""
+    try:
+        import yt_dlp.version
+        ytdlp = yt_dlp.version.__version__
+    except Exception:
+        ytdlp = "none"
+    try:
+        import runpod
+        rp = getattr(runpod, "__version__", "unknown")
+    except Exception:
+        rp = "none"
+    ff = _first_line([FFMPEG, "-version"]).split()          # "ffmpeg version 6.1.1 Copyright ..."
+    deno = _first_line(["deno", "--version"]).split()       # "deno 2.9.5 (stable, release, ...)"
+    return {"ytdlp": ytdlp, "ffmpeg": ff[2] if len(ff) > 2 and ff[1] == "version" else "none", "runpod": rp,
+            "js_runtime": " ".join(deno[:2]) if len(deno) >= 2 and deno[0] == "deno" else "none"}
+
+
+def boot_line(encoder, versions, proxy_url, state, fp, probe, probe_ms):
+    """The one boot line. Host and user are not secret (the README's
+    standard: the username shows in the vendor's dashboard); the password
+    and the URL never appear, only the fingerprint."""
+    host = user = "-"
+    if state == "on" and proxy_url:
+        parsed = urlparse(proxy_url)
+        host = f"{parsed.hostname}:{parsed.port}"
+        user = parsed.username or "-"
+    return (f"clip worker {IMAGE_TAG} encoder={encoder} ytdlp={versions['ytdlp']} ffmpeg={versions['ffmpeg']} "
+            f"runpod={versions['runpod']} js_runtime={versions['js_runtime']} proxy={state} proxy_host={host} "
+            f"proxy_user={user} proxy_fp={fp or '-'} proxy_probe={probe or '-'} "
+            f"probe_ms={'-' if probe_ms is None else probe_ms}")
+
+
 def log_startup():
-    log.info("clip worker %s encoder=%s proxy=%s", IMAGE_TAG, _ENCODER, PROXY_STATE)
+    """Probe the proxy (once; every result carries the word), then log the boot line."""
+    global PROXY_PROBE, PROXY_PROBE_MS
+    PROXY_PROBE, PROXY_PROBE_MS = probe_proxy(PROXY_URL, PROXY_STATE)
+    log.info("%s", boot_line(_ENCODER, tool_versions(), PROXY_URL, PROXY_STATE, PROXY_FP, PROXY_PROBE, PROXY_PROBE_MS))
 
 
 def handler(job):

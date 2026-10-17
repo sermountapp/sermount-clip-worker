@@ -16,6 +16,19 @@ sys.path.insert(0, ROOT)
 import handler  # noqa: E402
 
 SAMPLE = os.path.join(ROOT, "samples", "sample-10s.mp4")
+SECRET_PROXY = "http://user-sp1:s3cr3t%2Bpw@gate.example.test:10001"
+
+
+@pytest.fixture(autouse=True)
+def proxy_on(monkeypatch):
+    """v0.2.5: a YouTube job without a valid PROXY_URL fails fast, so every
+    test runs as a configured endpoint unless it says otherwise. The proxy
+    is fictitious; no test reaches it (fetches are faked or file://)."""
+    monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
+    monkeypatch.setattr(handler, "PROXY_STATE", "on")
+    monkeypatch.setattr(handler, "PROXY_FP", handler.proxy_fingerprint(SECRET_PROXY))
+    monkeypatch.setattr(handler, "PROXY_PROBE", "ok")
+    monkeypatch.setattr(handler, "PROXY_PROBE_MS", 120)
 
 
 def _job(**over):
@@ -113,7 +126,7 @@ def test_split_lines_breaks_near_the_middle():
 
 def test_ytdlp_options_carry_both_halves_of_the_fix():
     opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
-    assert opts["external_downloader_args"] == {"ffmpeg_o": ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]}
+    assert opts["external_downloader_args"]["ffmpeg_o"] == ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]
     assert opts["merge_output_format"] == "mp4"
     assert opts["force_keyframes_at_cuts"] is True
     assert opts["format"] == "bestvideo[height<=1080]+bestaudio/best"
@@ -121,8 +134,6 @@ def test_ytdlp_options_carry_both_halves_of_the_fix():
     assert handler.padded_range(100.3, 108.2) == (90, 119)
     assert handler.padded_range(4.0, 20.0) == (0, 30)
 
-
-SECRET_PROXY = "http://user-sp1:s3cr3t%2Bpw@gate.example.test:10001"
 
 
 @pytest.mark.parametrize("value,state", [
@@ -229,12 +240,17 @@ def test_proxy_url_never_reaches_a_log_line(monkeypatch, tmp_path, capsys):
         monkeypatch.setattr(handler, "PROXY_URL", SECRET_PROXY)
         monkeypatch.setattr(handler, "PROXY_STATE", "on")
         monkeypatch.setattr(handler, "_ENCODER", "libx264")
+        monkeypatch.setattr(handler, "probe_proxy", lambda url, state: ("auth", 41))
         handler.log_startup()
         monkeypatch.setattr(yt_dlp, "YoutubeDL", _fake_youtubedl(2, []))
         result = handler.run(_job())
     finally:
         handler.log.removeHandler(grab)
-    assert lines[0] == f"clip worker {handler.IMAGE_TAG} encoder=libx264 proxy=on"
+    boot = lines.pop(0)
+    assert boot.startswith(f"clip worker {handler.IMAGE_TAG} encoder=libx264 ") and " proxy=on " in boot
+    # host and user are shown in the boot line ONLY (not secret); never the password or the URL
+    assert "proxy_host=gate.example.test:10001 proxy_user=user-sp1 " in boot and "proxy_probe=auth probe_ms=41" in boot
+    assert "s3cr3t" not in boot and SECRET_PROXY not in boot
     assert any("yt-dlp failed type=DownloadError attempt=1" in ln for ln in lines)
     assert any("yt-dlp failed type=DownloadError attempt=2" in ln for ln in lines)
     assert result["ok"] is False and result["reason"] == "fetch"
@@ -887,3 +903,149 @@ def test_real_video_clip_is_smaller_48k_and_keyframes_at_most_two_seconds_apart(
     assert keys[0] == 0.0 and max(b - a for a, b in zip(keys, keys[1:])) <= 2.01, keys
     print(f"video 9 s: before {old.stat().st_size} bytes, v0.2.4 {new.stat().st_size} bytes, keyframes {keys}")
     assert new.stat().st_size < old.stat().st_size
+
+
+# ── v0.2.5: boot line, proxy probe, fail-fast config ─────────────────────────
+
+FAKE_VERSIONS = {"ytdlp": "2026.08.19", "ffmpeg": "6.1.1", "runpod": "1.12.0", "js_runtime": "deno 2.9.5"}
+
+
+def test_boot_line_has_every_field_in_order():
+    fp = handler.proxy_fingerprint(SECRET_PROXY)
+    line = handler.boot_line("h264_nvenc", FAKE_VERSIONS, SECRET_PROXY, "on", fp, "ok", 212)
+    assert line == (f"clip worker {handler.IMAGE_TAG} encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 "
+                    f"js_runtime=deno 2.9.5 proxy=on proxy_host=gate.example.test:10001 proxy_user=user-sp1 "
+                    f"proxy_fp={fp} proxy_probe=ok probe_ms=212")
+    assert "s3cr3t" not in line
+    off = handler.boot_line("libx264", dict(FAKE_VERSIONS, js_runtime="none"), None, "off", None, "skipped", None)
+    assert off.endswith("js_runtime=none proxy=off proxy_host=- proxy_user=- proxy_fp=- proxy_probe=skipped probe_ms=-")
+    # invalid: the fingerprint of what IS set still shows, so the operator can tell which value it holds
+    bad = "gate.example.test:10001"
+    inv = handler.boot_line("libx264", FAKE_VERSIONS, None, "invalid", handler.proxy_fingerprint(bad), "skipped", None)
+    assert f"proxy=invalid proxy_host=- proxy_user=- proxy_fp={handler.proxy_fingerprint(bad)} proxy_probe=skipped" in inv
+
+
+def test_proxy_fingerprint_matches_the_readme_recipe():
+    fp = handler.proxy_fingerprint("  " + SECRET_PROXY + "\n")
+    shell = subprocess.run(["sh", "-c", 'printf "%s" "$V" | shasum -a 256 | cut -c1-8'], env={**os.environ, "V": SECRET_PROXY},
+                           capture_output=True, text=True, check=True).stdout.strip()
+    assert fp == shell and len(fp) == 8 and int(fp, 16) >= 0
+    assert handler.proxy_fingerprint(None) is None and handler.proxy_fingerprint("  ") is None
+
+
+def test_tool_versions_read_this_machine():
+    v = handler.tool_versions()
+    import yt_dlp.version
+    assert v["ytdlp"] == yt_dlp.version.__version__ and v["runpod"] != "none"
+    if shutil.which("ffmpeg"):
+        assert v["ffmpeg"][0].isdigit(), v
+    assert v["js_runtime"] == "none" or v["js_runtime"].startswith("deno "), v
+
+
+def test_tool_versions_parse_first_lines(monkeypatch):
+    lines = {"deno": "deno 2.9.5 (stable, release, x86_64-unknown-linux-gnu)", handler.FFMPEG: "ffmpeg version 6.1.1 Copyright (c) 2000-2023"}
+    monkeypatch.setattr(handler, "_first_line", lambda cmd: lines.get(cmd[0], ""))
+    v = handler.tool_versions()
+    assert v["js_runtime"] == "deno 2.9.5" and v["ffmpeg"] == "6.1.1"
+    monkeypatch.setattr(handler, "_first_line", lambda cmd: "")
+    v = handler.tool_versions()
+    assert v["js_runtime"] == "none" and v["ffmpeg"] == "none"
+
+
+class _Resp:
+    def __init__(self, status): self.status_code = status
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+@pytest.mark.parametrize("status,word", [(200, "ok"), (407, "auth"), (502, "unreachable"), (403, "unreachable")])
+def test_probe_maps_the_status(monkeypatch, status, word):
+    seen = {}
+    def fake_get(url, proxies=None, timeout=None):
+        seen.update(url=url, proxies=proxies, timeout=timeout); return _Resp(status)
+    monkeypatch.setattr(handler.requests, "get", fake_get)
+    result, ms = handler.probe_proxy(SECRET_PROXY, "on")
+    assert result == word and isinstance(ms, int)
+    assert seen == {"url": handler.PROXY_PROBE_URL, "proxies": {"http": SECRET_PROXY, "https": SECRET_PROXY}, "timeout": (5, 10)}
+
+
+@pytest.mark.parametrize("state", ["off", "invalid"])
+def test_probe_is_skipped_without_a_valid_proxy(monkeypatch, state):
+    monkeypatch.setattr(handler.requests, "get", lambda *a, **k: pytest.fail("must not probe"))
+    assert handler.probe_proxy(None, state) == ("skipped", None)
+
+
+def _local_proxy(reply):
+    """A one-thread TCP server that answers every request (a CONNECT, for
+    an https URL) with `reply`, or never answers when reply is None."""
+    import socket
+    import threading
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    held = []
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                if reply is None:
+                    held.append(conn)       # stall: keep it open, say nothing
+                    continue
+                conn.sendall(reply)
+            except OSError:
+                pass
+            conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+def test_probe_reads_a_real_407_at_the_connect():
+    """requests raises ProxyError for a 407 on CONNECT rather than returning
+    the status; the probe must still say auth. Real requests, local proxy."""
+    srv, port = _local_proxy(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=x\r\n"
+                             b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    try:
+        assert handler.probe_proxy(f"http://user-sp1:s3cr3t@127.0.0.1:{port}", "on")[0] == "auth"
+    finally:
+        srv.close()
+
+
+def test_probe_reports_a_dead_proxy_unreachable():
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    assert handler.probe_proxy(f"http://u:p@127.0.0.1:{port}", "on")[0] == "unreachable"
+
+
+def test_a_failed_probe_never_stops_the_worker(monkeypatch):
+    monkeypatch.setattr(handler, "probe_proxy", lambda url, state: ("unreachable", 10001))
+    monkeypatch.setattr(handler, "tool_versions", lambda: FAKE_VERSIONS)
+    handler.log_startup()
+    assert handler.PROXY_PROBE == "unreachable" and handler.PROXY_PROBE_MS == 10001
+
+
+@pytest.mark.parametrize("state,detail", [("off", "PROXY_URL is not set"), ("invalid", "PROXY_URL is invalid")])
+def test_youtube_job_fails_fast_without_a_valid_proxy(quiet, monkeypatch, state, detail):
+    monkeypatch.setattr(handler, "PROXY_URL", None)
+    monkeypatch.setattr(handler, "PROXY_STATE", state)
+    monkeypatch.setattr(handler, "download", lambda *a, **k: pytest.fail("no cache GET, no download"))
+    monkeypatch.setattr(handler, "fetch_youtube_range", lambda *a: pytest.fail("no yt-dlp"))
+    out = handler.run(_job(cache={"get_url": "https://supabase.test/cache/x.mp4?token=C"}))
+    assert out["ok"] is False and out["reason"] == "fetch"
+    assert out["cause"] == "proxy_config" and out["cause_detail"] == detail
+    assert out["exec_ms"] < 1000 and not os.path.exists(quiet[0])
+
+
+@pytest.mark.parametrize("state", ["off", "invalid"])
+def test_audio_job_does_not_need_the_proxy(quiet, monkeypatch, state):
+    monkeypatch.setattr(handler, "PROXY_URL", None)
+    monkeypatch.setattr(handler, "PROXY_STATE", state)
+    monkeypatch.setattr(handler, "download", lambda url, dest, timeout=None: (shutil.copyfile(SAMPLE, dest), 1)[1])
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+    monkeypatch.setattr(handler.subprocess, "run", _fake_ffmpeg_ok)
+    out = handler.run(_audio_job())
+    assert out["ok"] is True and out["cause"] is None
