@@ -149,10 +149,10 @@ def test_ytdlp_options_carry_the_proxy_only_when_valid(monkeypatch, value, state
     opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
     if state == "on":
         assert opts["proxy"] == value
-        assert opts["external_downloader_args"]["ffmpeg_i"] == ["-http_proxy", value]
+        assert opts["external_downloader_args"]["ffmpeg_i"] == ["-rw_timeout", "20000000", "-http_proxy", value]
     else:
         assert "proxy" not in opts
-        assert "ffmpeg_i" not in opts["external_downloader_args"]
+        assert opts["external_downloader_args"]["ffmpeg_i"] == ["-rw_timeout", "20000000"]
     # the fix's two halves are untouched either way
     assert opts["external_downloader_args"]["ffmpeg_o"] == ["-c:v", "libx264", "-crf", "19", "-preset", "veryfast", "-c:a", "aac"]
     assert opts["merge_output_format"] == "mp4"
@@ -334,6 +334,10 @@ def test_ffmpegfd_spawns_our_encoder_args_and_an_mp4(tmp_path, monkeypatch, prox
             assert args[i - 2:i] == ["-http_proxy", proxy], args
     else:
         assert "-http_proxy" not in args
+    # v0.2.5: a stalled media socket ends ffmpeg after 20 s, on every input
+    for i in [i for i, a in enumerate(args) if a == "-i"]:
+        assert "-rw_timeout" in args[:i] and args[args.index("-rw_timeout") + 1] == "20000000"
+    assert args.count("-rw_timeout") == args.count("-i")
 
 
 # ── ffmpeg command ────────────────────────────────────────────────────────────
@@ -1231,3 +1235,99 @@ def test_reason_keeps_its_eight_words():
     src = open(os.path.join(ROOT, "handler.py")).read()
     reasons = set(__import__("re").findall(r'ClipError\(\s*"(\w+)"', src)) | {"error"}
     assert reasons <= {"input", "fetch", "cache", "render", "upload", "too_long", "timeout", "error"}, reasons
+
+
+# ── v0.2.5: the fetch's clocks ───────────────────────────────────────────────
+
+def test_socket_timeout_and_rw_timeout_are_explicit():
+    opts = handler.ytdlp_options("/tmp/x.mp4", 90, 118)
+    assert handler.SOCKET_TIMEOUT == 20.0 and opts["socket_timeout"] == 20.0
+    assert opts["external_downloader_args"]["ffmpeg_i"][:2] == ["-rw_timeout", "20000000"]
+    assert handler.ytdlp_options("/tmp/x.mp4", 90, 118, socket_timeout=7.5)["external_downloader_args"]["ffmpeg_i"][:2] == ["-rw_timeout", "7500000"]
+
+
+@pytest.mark.parametrize("value,want", [(None, 600.0), ("", 600.0), ("90", 90.0), ("x", 600.0), ("-5", 600.0)])
+def test_fetch_wall_secs_is_env_overridable(monkeypatch, value, want):
+    if value is None:
+        monkeypatch.delenv("FETCH_WALL_SECS", raising=False)
+    else:
+        monkeypatch.setenv("FETCH_WALL_SECS", value)
+    assert handler._env_secs("FETCH_WALL_SECS", 600.0) == want
+
+
+class _Clock:
+    def __init__(self): self.t = 1000.0
+    def now(self): return self.t
+    def sleep(self, s): self.t += s
+
+
+def _stalling_youtubedl(clock, stall, calls):
+    """Each attempt stalls for its whole socket timeout (capped at `stall`), then fails as yt-dlp would."""
+    class FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            import yt_dlp
+            calls.append((clock.t, self.opts["socket_timeout"]))
+            clock.t += min(stall, self.opts["socket_timeout"])
+            raise yt_dlp.utils.DownloadError("ERROR: unable to download video data: The read operation timed out")
+    return FakeYDL
+
+
+def test_a_stalled_fetch_ends_on_the_wall_clock_with_fetch_timeout(monkeypatch, tmp_path):
+    import yt_dlp
+    clock = _Clock()
+    monkeypatch.setattr(handler, "_now", clock.now)
+    monkeypatch.setattr(handler.time, "sleep", clock.sleep)
+    monkeypatch.setattr(handler, "FETCH_WALL_SECS", 30.0)
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _stalling_youtubedl(clock, 1e9, calls))
+    start = clock.t
+    with pytest.raises(handler.ClipError) as err:
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "s.mp4"), 90, 118)
+    assert err.value.reason == "fetch" and err.value.cause == "fetch_timeout"
+    assert "timed out" in err.value.detail                              # the last attempt's message is kept
+    # attempt 1 gets 20 s; after it and the 2 s sleep only 8 s are left, and attempt 2's budget is capped there
+    assert calls == [(start, 20.0), (start + 22.0, 8.0)]
+    assert clock.t - start <= handler.FETCH_WALL_SECS + 2 * handler.SOCKET_TIMEOUT
+
+
+def test_a_two_attempt_stall_ends_within_the_bound_at_the_default_clock(monkeypatch, tmp_path):
+    """At the default 600 s wall clock a stall is bounded by the socket
+    timeout per attempt, long before the wall clock: FETCH_WALL_SECS +
+    2 × socket_timeout is the ceiling the brief asks to verify."""
+    import yt_dlp
+    clock = _Clock()
+    monkeypatch.setattr(handler, "_now", clock.now)
+    monkeypatch.setattr(handler.time, "sleep", clock.sleep)
+    calls = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _stalling_youtubedl(clock, 1e9, calls))
+    start = clock.t
+    with pytest.raises(handler.ClipError) as err:
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "s.mp4"), 90, 118)
+    assert err.value.cause == "fetch_timeout"                         # classified from "timed out"
+    assert clock.t - start <= handler.FETCH_WALL_SECS + 2 * handler.SOCKET_TIMEOUT
+
+
+@pytest.mark.real
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg needed")
+@pytest.mark.parametrize("via_proxy", [False, True])
+def test_real_ffmpeg_rw_timeout_ends_a_stalled_input(via_proxy):
+    """Real ffmpeg against a local server that accepts and never answers
+    (directly, and as the -http_proxy): -rw_timeout 2 s ends it in ~2 s.
+    Without it ffmpeg would wait forever, and so would FFmpegFD."""
+    import time as _t
+    srv, port = _local_proxy(None)
+    try:
+        args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "2000000"]
+        if via_proxy:
+            args += ["-http_proxy", f"http://u:p@127.0.0.1:{port}", "-i", "http://media.example.test/v.mp4"]
+        else:
+            args += ["-i", f"http://127.0.0.1:{port}/v.mp4"]
+        t0 = _t.monotonic()
+        proc = subprocess.run(args + ["-f", "null", "-"], capture_output=True, text=True, timeout=30)
+        took = _t.monotonic() - t0
+    finally:
+        srv.close()
+    assert proc.returncode != 0 and 1.5 < took < 10, (took, proc.stderr)

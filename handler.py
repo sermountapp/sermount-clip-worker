@@ -145,6 +145,21 @@ YTDLP_MESSAGE_CAP = 300
 PROXY_PROBE_URL = "https://ip.decodo.com/json"
 PROXY_PROBE_TIMEOUT = (5, 10)
 
+def _env_secs(name, default):
+    try:
+        v = float(os.environ.get(name) or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+# The fetch's clocks (v0.2.5). Every attempt must finish inside the wall
+# clock, checked between attempts; inside an attempt, yt-dlp's socket timeout
+# and ffmpeg's -rw_timeout (per-socket inactivity, not total) bound a stall,
+# since yt-dlp's FFmpegFD waits on ffmpeg with no timeout of its own.
+FETCH_WALL_SECS = _env_secs("FETCH_WALL_SECS", 600.0)
+SOCKET_TIMEOUT = 20.0
+
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("clips")
 if not log.handlers:
@@ -1116,13 +1131,15 @@ class _RedactingYdlLogger:
         log.info("yt-dlp error: %s", redact(msg, self.secrets))
 
 
-def ytdlp_options(out_path, range_start, range_end):
+def ytdlp_options(out_path, range_start, range_end, proxy=None, socket_timeout=SOCKET_TIMEOUT):
     """yt-dlp options for one range. The encoder arguments go in
     external_downloader_args (FFmpegFD reads those; postprocessor_args is
     ignored with download_ranges) AND merge_output_format pins mp4: without
     the pin the container defaults to webm, which rejects H.264 and forces a
-    VP9 software transcode of every fetch (SermonVault §5)."""
+    VP9 software transcode of every fetch (SermonVault §5). `proxy` is this
+    attempt's proxy URL (PROXY_URL when not given)."""
     import yt_dlp
+    proxy = proxy or PROXY_URL
     opts = {
         "format": "bestvideo[height<=1080]+bestaudio/best",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(range_start, range_end)]),
@@ -1133,22 +1150,39 @@ def ytdlp_options(out_path, range_start, range_end):
         "quiet": True, "no_warnings": True, "noprogress": True,
         "retries": 3, "fragment_retries": 3,
         "noplaylist": True,
-        "logger": _RedactingYdlLogger(proxy_secrets(PROXY_URL)),
+        "socket_timeout": socket_timeout,
+        "logger": _RedactingYdlLogger(proxy_secrets(proxy)),
     }
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
+    # Before every -i: a media socket idle this long ends ffmpeg (microseconds).
+    ffmpeg_i = ["-rw_timeout", str(int(socket_timeout * 1_000_000))]
+    if proxy:
+        opts["proxy"] = proxy
         # With download_ranges FFmpegFD fetches the media; yt-dlp hands it
         # the proxy only as env vars, so pass it as ffmpeg's own input option
         # too (placed before every -i). The media URL is bound to the IP that
         # resolved it, so ffmpeg must leave through the same proxy.
-        opts["external_downloader_args"]["ffmpeg_i"] = ["-http_proxy", PROXY_URL]
+        ffmpeg_i += ["-http_proxy", proxy]
+    opts["external_downloader_args"]["ffmpeg_i"] = ffmpeg_i
     return opts
+
+
+def _now():
+    return time.monotonic()
 
 
 def fetch_youtube_range(url, out_path, range_start, range_end):
     import yt_dlp
-    opts = ytdlp_options(out_path, range_start, range_end)
+    deadline = _now() + FETCH_WALL_SECS
+    last = None
     for attempt in (1, 2):
+        remaining = deadline - _now()
+        if remaining <= 0:
+            # Cut between attempts. The last message (if any) stays as the detail.
+            raise ClipError("fetch", cause="fetch_timeout",
+                            detail=last or f"no file within FETCH_WALL_SECS={FETCH_WALL_SECS:g}")
+        # an attempt's own stall budget never runs past the wall clock
+        opts = ytdlp_options(out_path, range_start, range_end,
+                             socket_timeout=max(1.0, min(SOCKET_TIMEOUT, remaining)))
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
@@ -1156,14 +1190,13 @@ def fetch_youtube_range(url, out_path, range_start, range_end):
         except Exception as exc:
             # type only: a DownloadError message can quote the proxy URL
             log.info("yt-dlp failed type=%s attempt=%d", type(exc).__name__, attempt)
+            # redacted first (it can quote the proxy URL), classified on what the app may see
+            last = redact(exc, proxy_secrets(PROXY_URL))
             if attempt == 2:
-                # the cause from the last attempt's message, redacted first (it
-                # can quote the proxy URL) and classified on what the app may see
-                detail = redact(exc, proxy_secrets(PROXY_URL))
-                raise ClipError("fetch", cause=classify_fetch(detail), detail=detail)
+                raise ClipError("fetch", cause=classify_fetch(last), detail=last)
             if os.path.exists(out_path):
                 os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
-            time.sleep(FETCH_RETRY_SLEEP)
+            time.sleep(min(FETCH_RETRY_SLEEP, max(0.0, deadline - _now())))
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise ClipError("fetch", cause="fetch_other", detail="yt-dlp wrote no file")
 
