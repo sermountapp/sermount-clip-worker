@@ -865,7 +865,7 @@ def test_the_encode_constants_are_named():
     assert (handler.AUDIOGRAM_NVENC_CQ, handler.AUDIOGRAM_X264_CRF, handler.AUDIOGRAM_MAXRATE, handler.AUDIOGRAM_BUFSIZE) == ("30", "32", "0.8M", "1.6M")
     assert (handler.VIDEO_NVENC_CQ, handler.VIDEO_X264_CRF, handler.VIDEO_MAXRATE, handler.VIDEO_BUFSIZE) == ("26", "26", "4M", "8M")
     assert handler.GOP_FRAMES == "60" and handler.AUDIO_SAMPLE_RATE == "48000"
-    assert handler.IMAGE_TAG == "v0.2.5"
+    assert handler.IMAGE_TAG == "v0.2.6"
 
 
 def test_the_audio_only_output_is_48k_with_no_video_arguments():

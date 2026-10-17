@@ -73,7 +73,7 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
-IMAGE_TAG = "v0.2.5"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.6"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -1301,15 +1301,19 @@ def fetch_youtube_range(url, out_path, range_start, range_end):
                 ydl.download([url])
             break
         except Exception as exc:
-            # type only: a DownloadError message can quote the proxy URL
-            log.info("yt-dlp failed type=%s attempt=%d port=%s", type(exc).__name__, attempt,
-                     urlparse(proxy).port if proxy else "-")
             # redacted first (it can quote the proxy URL), classified on what the app may see
             last = redact(exc, secrets)
+            cause = classify_fetch(last)
+            # type and cause only: a DownloadError message can quote the proxy URL
+            log.info("yt-dlp failed type=%s attempt=%d port=%s cause=%s", type(exc).__name__, attempt,
+                     urlparse(proxy).port if proxy else "-", cause)
             if attempt == FETCH_ATTEMPTS:
-                raise ClipError("fetch", cause=classify_fetch(last), detail=last, ports_tried=len(used))
+                raise ClipError("fetch", cause=cause, detail=last, ports_tried=len(used))
             if os.path.exists(out_path):
                 os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
+            if cause == "proxy_auth":
+                # v0.2.6: every port checks the same login, so the next one is refused too
+                raise ClipError("fetch", cause=cause, detail=last, ports_tried=len(used))
             time.sleep(min(FETCH_RETRY_SLEEP, max(0.0, deadline - _now())))
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise ClipError("fetch", cause="fetch_other", detail="yt-dlp wrote no file", ports_tried=len(used))
