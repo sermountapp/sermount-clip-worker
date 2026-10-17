@@ -26,14 +26,21 @@ the output clock with the same list, so a caption never points at a cut word.
 Output (always; the handler never raises to RunPod):
 
     {"ok": true|false, "reason": null|"input|fetch|cache|render|upload|too_long|timeout|error",
-     "bytes", "duration", "fetch_ms", "render_ms", "exec_ms", "cache_hit", "encoder", "image_tag"}
+     "bytes", "duration", "fetch_ms", "render_ms", "exec_ms", "cache_hit", "encoder", "image_tag",
+     "cause": null|"<one word>", "cause_detail": null|"<redacted, one line, <= 300 chars>",
+     "proxy_probe": "ok|auth|unreachable|skipped", "proxy_fp": "<8 hex>"|null, "ports_tried": int|null}
+  (v0.2.5: `reason` keeps its eight words, which the app maps; `cause` says
+  which kind, e.g. fetch → proxy_config | proxy_auth | proxy_unreachable |
+  blocked | unavailable | no_format | fetch_timeout | fetch_other.)
 
 Rules (from SermonVault's measured findings, docs/edit-mode-clips-brief.md):
   - Fetch only the range: cache GET first; on a miss yt-dlp download_ranges
     over [start - 10, end + 10] with force_keyframes_at_cuts, 1080p cap, the
     encoder args in external_downloader_args (NOT postprocessor_args, which
     FFmpegFD ignores) AND merge_output_format mp4, then PUT the range to the
-    cache. One fetch at a time per worker process.
+    cache. One fetch at a time per worker process. YouTube needs PROXY_URL
+    (no proxy fails fast); three attempts rotate PROXY_PORTS inside a
+    FETCH_WALL_SECS clock, each stall bounded by a 20 s socket timeout.
   - Render: trim to the exact range, cut `removed` with select/aselect,
     centre-crop and scale, burn captions (never -c:v copy with a burn),
     loudnorm when asked. h264_nvenc when present, else libx264.
@@ -66,7 +73,7 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
-IMAGE_TAG = "v0.2.4"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.5"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024

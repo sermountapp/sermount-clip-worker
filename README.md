@@ -54,16 +54,35 @@ Output (always; the handler never raises):
 ```json
 {"ok": true, "reason": null, "bytes": 18214422, "duration": 90.2,
  "fetch_ms": 41200, "render_ms": 9800, "exec_ms": 51300,
- "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.1.0"}
+ "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.2.5",
+ "cause": null, "cause_detail": null, "proxy_probe": "ok", "proxy_fp": "1a2b3c4d", "ports_tried": 1}
 ```
 
-`reason` on failure, one word: `input`, `fetch` (the range could not be downloaded), `cache`,
-`render`, `upload`, `too_long` (output after removals over `max_output_seconds`), `timeout`,
-`error`.
+`reason` on failure is one of eight words, which the app maps (anything else reads as a worker
+failure there). Since v0.2.5 `cause` says which kind, and `cause_detail` carries the last
+attempt's message, redacted (no proxy fragment), one line, at most 300 characters, or `null`.
+Network errors carry the exception class only (their message quotes the signed URL).
+
+| `reason` | Meaning | `cause` |
+|---|---|---|
+| `input` | the job failed validation | `input`; `too_short` (under 0.5 s after removals) |
+| `fetch` | the source could not be had | YouTube, first match on the redacted message: `proxy_config` (PROXY_URL missing or invalid; fails before any download), `proxy_auth` (407), `proxy_unreachable` (cannot connect / tunnel failed / a timeout naming the proxy), `blocked` (bot wall, HTTP 403 / 429), `unavailable` (private, removed, region, age, live, premiere), `no_format` (format missing, signature or n challenge failed), `fetch_timeout` (the `FETCH_WALL_SECS` clock, or a read timeout), `fetch_other`. Stored audio: `source_http` (status in the detail), `source_empty`, `source_too_big`, `source_network` |
+| `cache` | (a cache PUT failure never fails a render) | `null` |
+| `render` | ffmpeg failed | `caption_track`, `encode` (ffmpeg's last stderr line in the detail), `encode_empty` |
+| `upload` | the signed PUT failed | `upload_http` (status in the detail), `upload_network` |
+| `too_long` | output after removals over `max_output_seconds` | `null` |
+| `timeout` | the encode ran past its limit | `encode_timeout` |
+| `error` | anything unexpected (never raised to RunPod) | the exception class name |
+
+The cause words are string matches on yt-dlp's messages, most specific first: a wording change
+downgrades a cause to `fetch_other`, never to a wrong word. `proxy_probe` and `proxy_fp` are the
+boot values (below) on every result; `ports_tried` is the number of proxy ports a fetch used
+(0 on a cache hit, `null` for audio).
 
 ## How it renders (the rules it follows)
 
-1. **Fetch only the range.** Cache GET first. On a miss, `yt-dlp` with `download_ranges` over
+1. **Fetch only the range.** YouTube needs `PROXY_URL`: without a valid one the job fails at once
+   (`cause: proxy_config`), before the cache GET. Cache GET first. On a miss, `yt-dlp` with `download_ranges` over
    `[start − 10, end + 10]` (rounded outward to whole seconds), `force_keyframes_at_cuts`, format
    `bestvideo[height<=1080]+bestaudio/best`, the encoder arguments in **`external_downloader_args`**
    (`{'ffmpeg_o': ['-c:v', 'libx264', '-crf', '19', '-preset', 'veryfast', '-c:a', 'aac']}`) **and**
@@ -73,6 +92,14 @@ Output (always; the handler never raises):
    every fetch (SermonVault measured 485–574 s per 120 s range before the fix, 40–74 s after).
    The test suite captures the argv FFmpegFD actually spawns and asserts both. Then the range is
    PUT to the cache. One fetch at a time per worker process.
+   Three attempts (v0.2.5), attempt *n* through `PROXY_PORTS[(n − 1) % len]` (yt-dlp's proxy and
+   ffmpeg's `-http_proxy` change together), all inside `FETCH_WALL_SECS` (checked between
+   attempts). Inside an attempt a stall is bounded by yt-dlp's `socket_timeout` (20 s) and
+   ffmpeg's `-rw_timeout` (20 s of socket inactivity, before every input; FFmpegFD waits on
+   ffmpeg with no timeout of its own), each capped at the time left on the clock.
+   deno 2.9.5 is baked into the image with `yt-dlp-ejs` 0.8.0 (the pair yt-dlp 2026.08.19 pins),
+   so yt-dlp solves YouTube's JS challenges locally: no "No supported JavaScript runtime" warning,
+   no remote components.
 2. **Render.** `trim` to the exact range, `select` / `aselect` cut the removed ranges, centre-crop
    to the aspect, scale, captions composited with `overlay`, `loudnorm` when asked. Never
    `-c:v copy` with a burn. `h264_nvenc` when the ffmpeg lists it, else `libx264` (chosen at
@@ -112,9 +139,37 @@ Dockerfile path `Dockerfile`.
 | Execution timeout | 5400 s (fetch time is dominated by YouTube's checks, not length) |
 | FlashBoot | on |
 | Network volume | none |
-| Environment variables | `PROXY_URL`: required for YouTube sermons (RunPod datacenter IPs get YouTube's "Sign in to confirm you're not a bot" wall without it). The same value the Render staging worker uses. Set it as an endpoint secret, never in the Dockerfile or a job input. Audio sermons do not use it. |
+| Environment variables | `PROXY_URL`: required for YouTube sermons (RunPod datacenter IPs get YouTube's "Sign in to confirm you're not a bot" wall without it); missing or malformed, every YouTube job fails at once with `cause: proxy_config`. The same value the Render staging worker uses. Set it as an endpoint secret, never in the Dockerfile or a job input. Audio sermons do not use it. |
+| | `PROXY_PORTS` (optional): ports to rotate through, comma or space separated (`10001 10002 10003`), parsed exactly as the app's `app/proxy.py` does; invalid entries dropped with a warning. `PROXY_URL` keeps the credentials. Unset: `PROXY_URL`'s own port for every attempt. |
+| | `FETCH_WALL_SECS` (optional, default `600`): the whole fetch's wall clock, every attempt included. |
 
 The worker also hands `PROXY_URL` to ffmpeg (`-http_proxy`) for the range fetch, so the proxy port must map to one fixed IP for the duration of a fetch: the media URL is bound to the IP that resolved it.
+
+### How to read the boot line
+
+Every worker logs one line at start (v0.2.5), in this order:
+
+```
+clip worker v0.2.5 encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 js_runtime=deno 2.9.5
+  proxy=on proxy_host=gate.example.com:10001 proxy_ports=1 proxy_user=user-sp1 proxy_fp=1a2b3c4d
+  proxy_probe=ok probe_ms=212
+```
+
+(one line in the log; values illustrative). `proxy` is `on`, `off` (unset) or `invalid` (no scheme, host or port);
+`proxy_host` is the first rotation port, `proxy_ports` how many. Host and user are not secret
+(the user shows in the vendor's dashboard); the password and the URL never appear.
+
+- **`proxy_fp`** is the first 8 hex characters of the sha256 of `PROXY_URL` (stripped). To check
+  which value the endpoint holds, hash the value you believe is set and compare; equal means
+  equal: `printf '%s' "$PROXY_URL" | shasum -a 256 | cut -c1-8`. It is shown for an invalid
+  value too, so a malformed secret can still be identified.
+- **`proxy_probe`**: one GET of `https://ip.decodo.com/json` through the first port at boot,
+  timeout 5 s connect / 10 s read, no retries. `ok` (200), `auth` (407: the password is wrong),
+  `unreachable` (anything else), `skipped` (proxy off or invalid). A failed probe never stops the
+  worker (the vendor's endpoint can be down while fetches work); each job's `cause` is the truth.
+  `probe_ms` is its latency.
+- A 407 seen on the proxy's side is not by itself a failure: ffmpeg sends its first request
+  without credentials and answers the 407 challenge (measured locally).
 
 After the endpoint exists, create an API key **scoped to this endpoint** (keys are per endpoint;
 the alignment key returns 403 here). It goes into the Render **worker** service only, as
