@@ -73,7 +73,7 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
-IMAGE_TAG = "v0.2.5"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.6"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
@@ -1185,6 +1185,47 @@ def _stderr_tail(stderr):
     return redact(lines[-1], ()) if lines else None
 
 
+def _ffreport_path(out_path, attempt):
+    """Where attempt n's ffmpeg report goes (v0.2.6): the job's temp dir, beside
+    the range. None when the path holds a character FFREPORT reads as syntax
+    (':' separates its options; quotes and backslashes escape), so a strange
+    temp dir costs the report, never a mis-parsed one."""
+    path = os.path.join(os.path.dirname(os.path.abspath(out_path)), f"ffmpeg-fetch-{attempt}.log")
+    return None if any(c in path for c in ":,'\\") else path
+
+
+# A URL in an ffmpeg line keeps its scheme and host; the path and query go.
+# ffmpeg 4.4 (the image's) writes the input URL first ("<url>: Connection
+# refused"), and a signed googlevideo URL is longer than YTDLP_MESSAGE_CAP: kept
+# whole, the cap would cut the error and leave the URL, whose numbers
+# (dur=407.2) could also match a cause pattern.
+_URL_TAIL = re.compile(r"\b([a-z][a-z0-9+.-]*://[^/\s?#]+)\S*?(?=:\s|:$|\s|$)", re.IGNORECASE)
+
+
+def _report_tail(path, secrets):
+    """The last non-empty line of an ffmpeg report, URLs cut to their host,
+    redacted; or None. The report opens with "Command line:" and the argv on
+    the next line, which carries -http_proxy and the media URL: everything up
+    to it is dropped, so a report with no error line has no tail rather than
+    the argv."""
+    try:
+        with open(path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    if "Command line:" in lines:
+        lines = lines[lines.index("Command line:") + 2:]
+    lines = [ln for ln in lines if ln.strip()]
+    return redact(_URL_TAIL.sub(r"\1", lines[-1]), secrets) if lines else None
+
+
+def _with_tail(message, tail):
+    """message | ffmpeg: tail, within YTDLP_MESSAGE_CAP; the message is cut
+    first, so ffmpeg's own line survives."""
+    suffix = f" | ffmpeg: {tail}"[:YTDLP_MESSAGE_CAP]
+    return message[:max(0, YTDLP_MESSAGE_CAP - len(suffix))] + suffix
+
+
 # Fetch causes (v0.2.5), first match wins, on the REDACTED message: the most
 # specific first, so a wording change downgrades to fetch_other, never to a
 # wrong word. "Names the proxy" means the message says proxy (a quoted URL
@@ -1296,21 +1337,44 @@ def fetch_youtube_range(url, out_path, range_start, range_end):
         # an attempt's own stall budget never runs past the wall clock
         opts = ytdlp_options(out_path, range_start, range_end, proxy=proxy,
                              socket_timeout=max(1.0, min(SOCKET_TIMEOUT, remaining)))
+        # v0.2.6: FFmpegFD runs ffmpeg at -loglevel quiet with our environment,
+        # so FFREPORT is the only way to hear why the media download died. The
+        # worker takes one job at a time and fetches under _FETCH_LOCK, so no
+        # other ffmpeg (a render above all) can see the variable while it is set.
+        report = _ffreport_path(out_path, attempt)
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
+            if report:
+                os.environ["FFREPORT"] = f"file={report}:level=16"   # 16: errors only
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            finally:
+                os.environ.pop("FFREPORT", None)
             break
         except Exception as exc:
-            # type only: a DownloadError message can quote the proxy URL
-            log.info("yt-dlp failed type=%s attempt=%d port=%s", type(exc).__name__, attempt,
-                     urlparse(proxy).port if proxy else "-")
             # redacted first (it can quote the proxy URL), classified on what the app may see
             last = redact(exc, secrets)
+            # ffmpeg's own error line goes in BEFORE classification: its "407"
+            # or "Connection refused" is the cause "ffmpeg exited with code 1" hides
+            tail = _report_tail(report, secrets) if report else None
+            if tail:
+                last = _with_tail(last, tail)
+            cause = classify_fetch(last)
+            # type and cause only: a DownloadError message can quote the proxy URL
+            log.info("yt-dlp failed type=%s attempt=%d port=%s cause=%s", type(exc).__name__, attempt,
+                     urlparse(proxy).port if proxy else "-", cause)
             if attempt == FETCH_ATTEMPTS:
-                raise ClipError("fetch", cause=classify_fetch(last), detail=last, ports_tried=len(used))
+                raise ClipError("fetch", cause=cause, detail=last, ports_tried=len(used))
             if os.path.exists(out_path):
                 os.remove(out_path)  # a half-written file would be skipped as "already downloaded"
+            if cause == "proxy_auth":
+                # v0.2.6: every port checks the same login, so the next one is refused too
+                raise ClipError("fetch", cause=cause, detail=last, ports_tried=len(used))
             time.sleep(min(FETCH_RETRY_SLEEP, max(0.0, deadline - _now())))
+        finally:
+            # the report echoes the argv, proxy URL included: never left on disk
+            if report and os.path.exists(report):
+                os.remove(report)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise ClipError("fetch", cause="fetch_other", detail="yt-dlp wrote no file", ports_tried=len(used))
     return len(used)

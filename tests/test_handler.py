@@ -865,7 +865,7 @@ def test_the_encode_constants_are_named():
     assert (handler.AUDIOGRAM_NVENC_CQ, handler.AUDIOGRAM_X264_CRF, handler.AUDIOGRAM_MAXRATE, handler.AUDIOGRAM_BUFSIZE) == ("30", "32", "0.8M", "1.6M")
     assert (handler.VIDEO_NVENC_CQ, handler.VIDEO_X264_CRF, handler.VIDEO_MAXRATE, handler.VIDEO_BUFSIZE) == ("26", "26", "4M", "8M")
     assert handler.GOP_FRAMES == "60" and handler.AUDIO_SAMPLE_RATE == "48000"
-    assert handler.IMAGE_TAG == "v0.2.5"
+    assert handler.IMAGE_TAG == "v0.2.6"
 
 
 def test_the_audio_only_output_is_48k_with_no_video_arguments():
@@ -1462,3 +1462,240 @@ def test_ejs_and_deno_pins_match_ytdlps_own_metadata():
     assert f"ARG DENO_VERSION={next(iter(deno)).split('==')[1]}" in docker
     assert _re.search(r"ARG DENO_SHA256=[0-9a-f]{64}\n", docker) and "sha256sum -c -" in docker
     assert "| head" not in docker.split("ARG DENO_VERSION")[1].split("RUN python3.11 -m venv")[0]   # pipefail: no early-exit pipes
+
+
+# ── v0.2.6: a proxy_auth ends the fetch; ffmpeg's report on a failed attempt ──
+
+_407_REPLY = (b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=x\r\n"
+              b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+
+def _counting_youtubedl(real, calls):
+    """The real YoutubeDL, each construction recorded with its proxy."""
+    class Counting(real):
+        def __init__(self, opts):
+            calls.append(opts.get("proxy"))
+            super().__init__(opts)
+    return Counting
+
+
+def test_a_407_on_attempt_1_ends_the_fetch_without_rotating(monkeypatch, tmp_path):
+    """Real yt-dlp against a local proxy that answers 407, three rotation
+    ports: one YoutubeDL, no sleep, proxy_auth with ports_tried=1, and the
+    log line names the cause."""
+    import logging
+    import yt_dlp
+    srvs = [_local_proxy(_407_REPLY) for _ in range(3)]
+    urls = [f"http://user-sp1:s3cr3t@127.0.0.1:{port}" for _, port in srvs]
+    monkeypatch.setattr(handler, "PROXY_URLS", urls)
+    sleeps, calls, lines = [], [], []
+    monkeypatch.setattr(handler.time, "sleep", sleeps.append)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _counting_youtubedl(yt_dlp.YoutubeDL, calls))
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            lines.append(self.format(record))
+
+    grab = Grab()
+    handler.log.addHandler(grab)
+    out = tmp_path / "source.mp4"
+    out.write_bytes(b"half")                         # a half-written file never survives the stop
+    try:
+        with pytest.raises(handler.ClipError) as err:
+            handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(out), 90, 118)
+    finally:
+        handler.log.removeHandler(grab)
+        for srv, _ in srvs:
+            srv.close()
+    e = err.value
+    assert (e.reason, e.cause, e.ports_tried) == ("fetch", "proxy_auth", 1), e.detail
+    assert calls == [urls[0]] and sleeps == []
+    assert not out.exists()
+    assert "407 Proxy Authentication Required" in e.detail and "s3cr3t" not in e.detail
+    assert [ln for ln in lines if ln.startswith("yt-dlp failed")] == [
+        f"yt-dlp failed type=DownloadError attempt=1 port={srvs[0][1]} cause=proxy_auth"]
+
+
+def test_a_407_through_run_reports_one_port(quiet, monkeypatch):
+    import yt_dlp
+    monkeypatch.setattr(handler, "PROXY_URLS", handler.get_proxy_urls(SECRET_PROXY, "10001 10002 10003"))
+    calls = []
+    monkeypatch.setattr(handler.time, "sleep", lambda s: pytest.fail("no sleep after a 407"))
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _raising_youtubedl(
+        "ERROR: [youtube] x: Unable to download API page: ('Unable to connect to proxy', "
+        "OSError('Tunnel connection failed: 407 Proxy Authentication Required'))", calls))
+    out = handler.run(_job())
+    assert (out["ok"], out["reason"], out["cause"], out["ports_tried"]) == (False, "fetch", "proxy_auth", 1)
+    assert len(calls) == 1
+
+
+def _ffreport_youtubedl(seen, fail_with=None, report_line=None):
+    """Records FFREPORT as the download sees it; on failure writes the report
+    ffmpeg would have (header + argv + error line) where FFREPORT points."""
+    class FakeYDL:
+        def __init__(self, opts): self.opts = opts
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            import yt_dlp
+            env = os.environ.get("FFREPORT")
+            seen.append(env)
+            if fail_with is None:
+                shutil.copyfile(SAMPLE, self.opts["outtmpl"])
+                return
+            if env and report_line:
+                path = env[len("file="):env.rindex(":level=")]
+                with open(path, "w") as fh:
+                    fh.write(f"Command line:\nffmpeg -http_proxy {self.opts['proxy']} -i https://x.test/v\n{report_line}\n")
+            raise yt_dlp.utils.DownloadError(fail_with)
+    return FakeYDL
+
+
+def test_ffreport_is_set_only_during_the_download(monkeypatch, tmp_path):
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    monkeypatch.delenv("FFREPORT", raising=False)
+    seen = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _ffreport_youtubedl(seen))
+    out = tmp_path / "source.mp4"
+    handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(out), 90, 118)
+    assert seen == [f"file={tmp_path / 'ffmpeg-fetch-1.log'}:level=16"]
+    assert "FFREPORT" not in os.environ
+
+    seen.clear()
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _ffreport_youtubedl(seen, "ERROR: ffmpeg exited with code 1", "boom"))
+    with pytest.raises(handler.ClipError):
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "f.mp4"), 90, 118)
+    assert seen == [f"file={tmp_path / f'ffmpeg-fetch-{n}.log'}:level=16" for n in (1, 2, 3)]
+    assert "FFREPORT" not in os.environ
+    assert not list(tmp_path.glob("ffmpeg-fetch-*.log"))      # the report echoes the argv: never left on disk
+
+
+def test_ffreport_is_skipped_on_a_path_ffreport_would_misread(monkeypatch, tmp_path):
+    import yt_dlp
+    monkeypatch.delenv("FFREPORT", raising=False)
+    odd = tmp_path / "a:b"
+    odd.mkdir()
+    seen = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _ffreport_youtubedl(seen))
+    handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(odd / "source.mp4"), 90, 118)
+    assert seen == [None]
+
+
+def test_the_render_ffmpeg_never_sees_ffreport(quiet, monkeypatch):
+    """A cache miss fetches (FFREPORT set inside the attempt), then renders:
+    every subprocess the render spawns runs with no FFREPORT in its env."""
+    import yt_dlp
+    monkeypatch.delenv("FFREPORT", raising=False)
+    seen, spawned = [], []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _ffreport_youtubedl(seen))
+    monkeypatch.setattr(handler, "upload", lambda *a: None)
+
+    def run(cmd, **kw):
+        spawned.append((kw.get("env") or os.environ).get("FFREPORT"))
+        return _fake_ffmpeg_ok(cmd, **kw)
+
+    monkeypatch.setattr(handler.subprocess, "run", run)
+    out = handler.run(_job())
+    assert out["ok"] is True, out
+    assert seen and seen[0].startswith("file=")             # the fetch had it
+    assert spawned and spawned == [None] * len(spawned)     # the render never did
+    assert not any(f.startswith("ffmpeg-fetch-") for d in quiet if os.path.isdir(d) for f in os.listdir(d))
+
+
+def test_a_failed_attempt_carries_ffmpegs_line_redacted_and_capped(monkeypatch, tmp_path):
+    """The report line from real ffmpeg 4.4.2 (`<input url>: <error>`, the
+    image's wording, measured in an Ubuntu 22.04 container) is appended
+    after the yt-dlp message, its URL cut to the host and the proxy
+    redacted, within the cap with the ffmpeg line kept whole."""
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    line = ("[tcp @ 0x56504ae0ae80] Connection to tcp://gate.example.test:10001 failed: Connection refused\n"
+            "https://rr3---sn-abc.googlevideo.com/videoplayback?expire=1760000000&dur=407.2&ip=203.0.113.9"
+            "&sig=" + "A" * 600 + ": Connection refused")
+    seen = []
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _ffreport_youtubedl(seen, "ERROR: ffmpeg exited with code 1 " + "z" * 400, line))
+    with pytest.raises(handler.ClipError) as err:
+        handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "s.mp4"), 90, 118)
+    d = err.value.detail
+    assert d.endswith(" | ffmpeg: https://rr3---sn-abc.googlevideo.com: Connection refused"), d
+    assert d.startswith("ERROR: ffmpeg exited with code 1 zzz") and len(d) <= handler.YTDLP_MESSAGE_CAP
+    assert err.value.cause == "fetch_other"                  # dur=407.2 never reads as a 407
+    for part in ("s3cr3t", "user-sp1", "gate.example.test"):
+        assert part not in d
+
+
+def test_report_tail_drops_the_argv_header_and_redacts(tmp_path):
+    secrets = handler.proxy_secrets(SECRET_PROXY)
+    p = tmp_path / "r.log"
+    p.write_text(f"Command line:\nffmpeg -loglevel quiet -http_proxy {SECRET_PROXY} -i https://x.test/v\n")
+    assert handler._report_tail(str(p), secrets) is None    # no error line: no tail, never the argv
+    p.write_text(f"Command line:\nffmpeg -i x\n\n{SECRET_PROXY}: Connection refused\n\n")
+    assert handler._report_tail(str(p), secrets) == "[proxy]: Connection refused"
+    assert handler._report_tail(str(tmp_path / "missing.log"), secrets) is None
+
+
+def _real_ffmpegfd_youtubedl(real, info):
+    """download() hands `info` to the real FFmpegFD (real ffmpeg, real env
+    handling, real "exited with code" error) instead of extracting."""
+    from yt_dlp.downloader.external import FFmpegFD
+
+    class FakeYDL:
+        def __init__(self, opts): self.ydl = real(opts)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def download(self, urls):
+            FFmpegFD(self.ydl, self.ydl.params).download(self.ydl.params["outtmpl"]["default"], dict(info))
+    return FakeYDL
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs the ffmpeg binary on PATH")
+def test_real_ffmpeg_writes_ffreport_under_loglevel_quiet(tmp_path):
+    """The one thing Part 2 rests on: -loglevel quiet silences stderr, not
+    the FFREPORT file. Checked on 8.1.1 (local) and 4.4.2 (the image's)."""
+    report = tmp_path / "r.log"
+    proc = subprocess.run([shutil.which("ffmpeg"), "-loglevel", "quiet", "-hide_banner", "-i", "/nonexistent", "-f", "null", "-"],
+                          capture_output=True, text=True, env=dict(os.environ, FFREPORT=f"file={report}:level=16"))
+    assert proc.returncode != 0 and proc.stderr == ""
+    text = report.read_text()
+    assert "/nonexistent" in text.split("Command line:", 1)[1].split("\n", 2)[2], text
+    assert "No such file or directory" in handler._report_tail(str(report), ())
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs the ffmpeg binary on PATH")
+@pytest.mark.parametrize("answer", ["407", "dead"])
+def test_real_ffmpegfd_failure_reaches_the_detail(monkeypatch, tmp_path, answer):
+    """End to end on this machine's ffmpeg: real FFmpegFD through a local
+    proxy that answers 407 (or a closed port). ffmpeg never prints "407"
+    (8.1.1 and 4.4.2 both say "Server returned 4XX Client Error, but not one
+    of 40{0,1,3,4}"), so the cause stays fetch_other; what changes is that
+    the detail now says what ffmpeg saw instead of only its exit code."""
+    import socket
+    import yt_dlp
+    monkeypatch.setattr(handler, "FETCH_RETRY_SLEEP", 0)
+    monkeypatch.delenv("FFREPORT", raising=False)
+    if answer == "407":
+        srv, port = _local_proxy(_407_REPLY)
+    else:
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close(); srv = None
+    proxy = f"http://user-sp1:s3cr3t@127.0.0.1:{port}"
+    monkeypatch.setattr(handler, "PROXY_URL", proxy)
+    info = {"url": "https://media.example.test/v.mp4?sig=abc", "ext": "mp4", "protocol": "https",
+            "section_start": 0, "section_end": 5, "http_headers": {}}
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _real_ffmpegfd_youtubedl(yt_dlp.YoutubeDL, info))
+    try:
+        with pytest.raises(handler.ClipError) as err:
+            handler.fetch_youtube_range("https://www.youtube.com/watch?v=dQw4w9WgXcQ", str(tmp_path / "source.mp4"), 0, 5)
+    finally:
+        if srv:
+            srv.close()
+    d = err.value.detail
+    assert d.startswith("ERROR: ffmpeg exited with code ") and " | ffmpeg: " in d, d
+    tail = d.split(" | ffmpeg: ", 1)[1]
+    assert tail and "Command line" not in tail and "sig=abc" not in tail
+    if answer == "407":
+        assert "4XX Client Error" in tail
+    assert err.value.cause == "fetch_other"
+    for part in ("s3cr3t", "user-sp1"):
+        assert part not in d
+    assert "FFREPORT" not in os.environ and not list(tmp_path.glob("ffmpeg-fetch-*.log"))

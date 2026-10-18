@@ -54,13 +54,20 @@ Output (always; the handler never raises):
 ```json
 {"ok": true, "reason": null, "bytes": 18214422, "duration": 90.2,
  "fetch_ms": 41200, "render_ms": 9800, "exec_ms": 51300,
- "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.2.5",
+ "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.2.6",
  "cause": null, "cause_detail": null, "proxy_probe": "ok", "proxy_fp": "1a2b3c4d", "ports_tried": 1}
 ```
 
 `reason` on failure is one of eight words, which the app maps (anything else reads as a worker
 failure there). Since v0.2.5 `cause` says which kind, and `cause_detail` carries the last
 attempt's message, redacted (no proxy fragment), one line, at most 300 characters, or `null`.
+Since v0.2.6 a YouTube fetch whose ffmpeg failed ends with ffmpeg's own last error line:
+`ERROR: ffmpeg exited with code 8 | ffmpeg: Error opening input files: Connection refused`.
+yt-dlp runs that ffmpeg at `-loglevel quiet`, so the worker reads it from an `FFREPORT` file
+(`level=16`, errors only) in the job's temp dir, set for the download alone and deleted after each
+attempt; a URL in the line keeps only its scheme and host, and the yt-dlp text is cut first so the
+ffmpeg line survives the cap. ffmpeg does not name a proxy 407 (4.4 and 8.1 both say "Server
+returned 4XX Client Error, but not one of 40{0,1,3,4}"), so such a fetch still reads `fetch_other`.
 Network errors carry the exception class only (their message quotes the signed URL).
 
 | `reason` | Meaning | `cause` |
@@ -94,7 +101,9 @@ boot values (below) on every result; `ports_tried` is the number of proxy ports 
    PUT to the cache. One fetch at a time per worker process.
    Three attempts (v0.2.5), attempt *n* through `PROXY_PORTS[(n − 1) % len]` (yt-dlp's proxy and
    ffmpeg's `-http_proxy` change together), all inside `FETCH_WALL_SECS` (checked between
-   attempts). Inside an attempt a stall is bounded by yt-dlp's `socket_timeout` (20 s) and
+   attempts). A `proxy_auth` ends the fetch on the first attempt (v0.2.6): the login is shared by
+   every port. Each failed attempt logs `yt-dlp failed type=... attempt=... port=... cause=...`.
+   Inside an attempt a stall is bounded by yt-dlp's `socket_timeout` (20 s) and
    ffmpeg's `-rw_timeout` (20 s of socket inactivity, before every input; FFmpegFD waits on
    ffmpeg with no timeout of its own), each capped at the time left on the clock.
    deno 2.9.5 is baked into the image with `yt-dlp-ejs` 0.8.0 (the pair yt-dlp 2026.08.19 pins),
@@ -150,7 +159,7 @@ The worker also hands `PROXY_URL` to ffmpeg (`-http_proxy`) for the range fetch,
 Every worker logs one line at start (v0.2.5), in this order:
 
 ```
-clip worker v0.2.5 encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 js_runtime=deno 2.9.5
+clip worker v0.2.6 encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 js_runtime=deno 2.9.5
   proxy=on proxy_host=gate.example.com:10001 proxy_ports=1 proxy_user=user-sp1 proxy_fp=1a2b3c4d
   proxy_probe=ok probe_ms=212
 ```
