@@ -73,7 +73,7 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 import requests
 
-IMAGE_TAG = "v0.2.6"  # bump with every release; the app records it per render
+IMAGE_TAG = "v0.2.7"  # bump with every release; the app records it per render
 
 PAD_SECS = 10.0
 MAX_SOURCE_BYTES = 4 * 1024 * 1024 * 1024
