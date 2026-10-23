@@ -1,0 +1,37 @@
+# Weekly dependency PRs (sermount-web docs/security-hygiene-brief.md Part 4).
+# Minor and patch updates arrive grouped, one PR per ecosystem; majors come one
+# by one. Dependabot *alerts* are a repository setting, switched on separately.
+# Every push to main builds and deploys this worker on RunPod: merge a PR only
+# after the local checks in the README, as with any release.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The digest-pinned runpod/base line in the Dockerfile gets a PR when the tag moves.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      docker-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]

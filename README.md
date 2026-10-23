@@ -54,7 +54,7 @@ Output (always; the handler never raises):
 ```json
 {"ok": true, "reason": null, "bytes": 18214422, "duration": 90.2,
  "fetch_ms": 41200, "render_ms": 9800, "exec_ms": 51300,
- "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.2.6",
+ "cache_hit": false, "encoder": "h264_nvenc", "image_tag": "v0.2.7",
  "cause": null, "cause_detail": null, "proxy_probe": "ok", "proxy_fp": "1a2b3c4d", "ports_tried": 1}
 ```
 
@@ -159,7 +159,7 @@ The worker also hands `PROXY_URL` to ffmpeg (`-http_proxy`) for the range fetch,
 Every worker logs one line at start (v0.2.5), in this order:
 
 ```
-clip worker v0.2.6 encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 js_runtime=deno 2.9.5
+clip worker v0.2.7 encoder=h264_nvenc ytdlp=2026.08.19 ffmpeg=6.1.1 runpod=1.12.0 js_runtime=deno 2.9.5
   proxy=on proxy_host=gate.example.com:10001 proxy_ports=1 proxy_user=user-sp1 proxy_fp=1a2b3c4d
   proxy_probe=ok probe_ms=212
 ```

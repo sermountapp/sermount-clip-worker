@@ -7,4 +7,10 @@ yt-dlp==2026.8.19
 # in the default and pin extras). Bump with yt-dlp, never alone.
 yt-dlp-ejs==0.8.0
 requests==2.34.2
-pillow==12.2.0
+pillow==13.0.0
+# Security floors on transitive packages (2026-10-23 review), at the versions
+# the v0.2.7 image resolved: Brotli arrives through runpod's aiohttp[speedups]
+# and decodes Content-Encoding: br bodies (1.2.1 fixes CVE-2026-111497,
+# "Node2Shell"); certifi 2026.10.23 drops the compromised emSign intermediates.
+brotli==1.2.1
+certifi==2026.10.23
