@@ -1,7 +1,7 @@
 # Pinned 2026-10-09. yt-dlp matches sermount-web's pin (same proxy-free
 # range fetch rules); runpod matches the whisperx worker.
 runpod==1.12.0
-yt-dlp==2026.8.19
+yt-dlp==2026.10.21
 # The challenge-solver scripts yt-dlp runs in deno (Dockerfile), at the
 # version yt-dlp 2026.08.19 itself requires (its METADATA: yt-dlp-ejs==0.8.0
 # in the default and pin extras). Bump with yt-dlp, never alone.
